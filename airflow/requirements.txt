@@ -1,20 +1,24 @@
 # =============================================================================
 # Airflow Python Dependencies
 # =============================================================================
-# Pinned versions for reproducible builds.
-# Update versions deliberately and test before deploying.
+# Versions are intentionally unpinned for packages covered by Airflow's
+# constraints file (constraints-<AIRFLOW_VERSION>/constraints-<PYTHON>.txt).
+# The constraints file pins every transitive dependency to versions tested
+# against the exact Airflow release, preventing conflicts.
+#
+# Only pin versions for packages NOT present in the constraints file.
 # =============================================================================
 
 # --- AWS / S3-compatible storage ---
-boto3==1.35.81
+boto3
 
 # --- Trino query engine ---
-trino==0.330.0
-apache-airflow-providers-trino==5.8.0
+trino
+apache-airflow-providers-trino
 
 # --- Celery executor backend ---
-apache-airflow-providers-celery==3.8.5
+apache-airflow-providers-celery
 
 # --- Data processing ---
-pyarrow==18.1.0
-pandas==2.2.3
+pyarrow
+pandas
