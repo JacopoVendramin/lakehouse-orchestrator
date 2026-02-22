@@ -1,0 +1,80 @@
+# =============================================================================
+# Prometheus Alert Rules — Lakehouse Platform
+# =============================================================================
+
+groups:
+  - name: lakehouse_alerts
+    rules:
+
+      # -----------------------------------------------------------------------
+      # ServiceDown — any scrape target unreachable for more than 1 minute
+      # -----------------------------------------------------------------------
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} is down"
+          description: >-
+            The target {{ $labels.instance }} (job {{ $labels.job }})
+            has been unreachable for more than 1 minute.
+
+      # -----------------------------------------------------------------------
+      # AirflowTaskFailureHigh — sustained task failures from Airflow
+      # Fires when airflow_ti_failures has been increasing for 5 minutes.
+      # -----------------------------------------------------------------------
+      - alert: AirflowTaskFailureHigh
+        expr: rate(airflow_ti_failures[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Airflow task failure rate is elevated"
+          description: >-
+            The rate of airflow_ti_failures has been above zero
+            for the last 5 minutes (current value: {{ $value }}).
+
+      # -----------------------------------------------------------------------
+      # SeaweedFSDiskUsageHigh — SeaweedFS volume disk usage exceeds 80%
+      # -----------------------------------------------------------------------
+      - alert: SeaweedFSDiskUsageHigh
+        expr: (seaweedfs_volume_disk_used_bytes / seaweedfs_volume_disk_total_bytes) * 100 > 80
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SeaweedFS disk usage above 80%"
+          description: >-
+            SeaweedFS volume {{ $labels.instance }} disk usage is at
+            {{ $value | printf "%.1f" }}%.
+
+      # -----------------------------------------------------------------------
+      # ValkeyMemoryHigh — Valkey memory usage exceeds 80% of maxmemory
+      # Uses metrics exposed by redis_exporter.
+      # -----------------------------------------------------------------------
+      - alert: ValkeyMemoryHigh
+        expr: (redis_memory_used_bytes / redis_memory_max_bytes) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Valkey memory usage above 80%"
+          description: >-
+            Valkey instance {{ $labels.instance }} memory usage is at
+            {{ $value | printf "%.1f" }}% of configured maxmemory.
+
+      # -----------------------------------------------------------------------
+      # PostgresConnectionsHigh — active connections exceed 80% of max
+      # Uses metrics exposed by postgres_exporter.
+      # -----------------------------------------------------------------------
+      - alert: PostgresConnectionsHigh
+        expr: (pg_stat_activity_count / pg_settings_max_connections) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL active connections above 80% of max"
+          description: >-
+            PostgreSQL instance {{ $labels.instance }} has
+            {{ $value | printf "%.1f" }}% of max_connections in use.

@@ -1,0 +1,72 @@
+# =============================================================================
+# Prometheus Configuration — Lakehouse Platform
+# =============================================================================
+# All scrape targets run on the Docker network "lakehouse-network".
+# Trino is intentionally excluded: it does not expose a native /metrics
+# endpoint. Monitor Trino via Grafana's Trino plugin or direct SQL queries.
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# -----------------------------------------------------------------------------
+# Alert rules
+# -----------------------------------------------------------------------------
+rule_files:
+  - "alert_rules.yml"
+
+# -----------------------------------------------------------------------------
+# Scrape targets
+# -----------------------------------------------------------------------------
+scrape_configs:
+
+  # ---------------------------------------------------------------------------
+  # Prometheus self-monitoring
+  # ---------------------------------------------------------------------------
+  - job_name: "prometheus"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # ---------------------------------------------------------------------------
+  # Airflow — metrics collected via StatsD Exporter
+  # Airflow emits StatsD metrics; the exporter converts them to Prometheus
+  # format on port 9102.
+  # ---------------------------------------------------------------------------
+  - job_name: "airflow"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["statsd-exporter:9102"]
+
+  # ---------------------------------------------------------------------------
+  # SeaweedFS Master — exposes Prometheus metrics natively
+  # ---------------------------------------------------------------------------
+  - job_name: "seaweedfs-master"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["seaweedfs-master:9324"]
+
+  # ---------------------------------------------------------------------------
+  # SeaweedFS Volume — exposes Prometheus metrics natively
+  # ---------------------------------------------------------------------------
+  - job_name: "seaweedfs-volume"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["seaweedfs-volume:9325"]
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — via postgres_exporter
+  # ---------------------------------------------------------------------------
+  - job_name: "postgres"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  # ---------------------------------------------------------------------------
+  # Valkey (Redis-compatible) — via redis_exporter
+  # ---------------------------------------------------------------------------
+  - job_name: "valkey"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["valkey-exporter:9121"]
