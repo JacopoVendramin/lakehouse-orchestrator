@@ -94,7 +94,7 @@ cp .env.example .env
 docker compose up -d
 ```
 
-Initial startup takes approximately 2-3 minutes. Airflow runs database migrations and creates the admin user on first boot. SeaweedFS buckets (`lakehouse`, `lakehouse-warehouse`) are provisioned automatically by the `s3-init` container.
+Initial startup takes approximately 2-3 minutes. Airflow runs database migrations and creates the admin user on first boot. SeaweedFS buckets (`lakehouse`, `lakehouse-warehouse`, `csv-uploads`) are provisioned automatically by the `s3-init` container.
 
 Verify all services are healthy:
 
@@ -126,6 +126,8 @@ All ports are configurable via environment variables in `.env`.
 
 ## How to Trigger the DAG
 
+### Sales Pipeline (Manual)
+
 The `csv_to_iceberg_pipeline` DAG is paused by default. Unpause and trigger it from the Airflow UI or the CLI:
 
 ```bash
@@ -145,6 +147,54 @@ The pipeline executes five sequential tasks:
 5. **insert_data_into_iceberg** -- loads rows using a delete-then-insert pattern for idempotency
 
 Monitor progress in the Airflow UI at [http://localhost:8081](http://localhost:8081) or watch Celery worker activity in Flower at [http://localhost:5555](http://localhost:5555).
+
+### CSV Auto-Ingest Pipeline (Automatic)
+
+The `csv_auto_ingest` DAG polls the `s3://csv-uploads` bucket every 5 minutes for new CSV files and automatically creates Iceberg tables from them. No schema definition or DAG modification is needed.
+
+**Usage:**
+
+1. Unpause the DAG:
+
+   ```bash
+   docker compose exec airflow-webserver airflow dags unpause csv_auto_ingest
+   ```
+
+2. Upload a CSV to the ingest bucket. The directory name becomes the table name:
+
+   ```bash
+   # Upload via aws CLI
+   aws --endpoint-url http://localhost:8333 s3 cp my_data.csv s3://csv-uploads/my_table/my_data.csv
+
+   # Or via curl (SeaweedFS S3 gateway)
+   curl -X PUT "http://localhost:8333/csv-uploads/my_table/my_data.csv" \
+     --data-binary @my_data.csv
+   ```
+
+3. Wait for the next polling cycle (up to 5 minutes) or trigger manually:
+
+   ```bash
+   docker compose exec airflow-webserver airflow dags trigger csv_auto_ingest
+   ```
+
+4. Query the new table in Trino:
+
+   ```sql
+   SELECT * FROM iceberg.lakehouse.my_table;
+   ```
+
+**Features:**
+
+| Feature | Details |
+|---------|---------|
+| Schema inference | Detects INTEGER, BIGINT, DOUBLE, BOOLEAN, DATE, TIMESTAMP, VARCHAR |
+| Delimiter detection | Auto-detects comma, semicolon, tab, pipe via `csv.Sniffer` |
+| Schema evolution | New columns in re-uploaded CSVs are added via `ALTER TABLE ADD COLUMN` |
+| Idempotent | ETag-based tracking prevents re-processing unchanged files |
+| Replace strategy | Re-uploading a file replaces only its rows (keyed on `_source_file`) |
+| Audit columns | `_source_file` and `_ingested_at` added to every row |
+| Superset auto-registration | New tables are automatically registered as Superset datasets |
+| Parallel processing | Multiple files processed concurrently via CeleryExecutor |
 
 ---
 
@@ -263,7 +313,13 @@ LIMIT 5;
 lakehouse-orchestrator/
 ├── airflow/
 │   ├── dags/
-│   │   └── csv_to_iceberg_celery.py   # Ingestion DAG: CSV → S3 → Iceberg
+│   │   ├── csv_to_iceberg_celery.py   # Ingestion DAG: CSV → S3 → Iceberg
+│   │   ├── csv_auto_ingest.py         # Auto-ingest DAG: S3 polling → schema inference → Iceberg
+│   │   └── lib/
+│   │       ├── __init__.py
+│   │       ├── type_inference.py      # Column type detection engine
+│   │       ├── schema_manager.py      # DDL generation and schema evolution
+│   │       └── superset_client.py     # Superset dataset auto-registration
 │   ├── plugins/                        # Custom Airflow plugins (extensible)
 │   ├── Dockerfile                      # Custom Airflow image (boto3, trino, celery)
 │   └── requirements.txt               # Python dependencies (unpinned; managed by Airflow constraints)
@@ -331,6 +387,7 @@ This project follows a spec-driven development methodology. Each major component
 | [`specs/iceberg_tables.md`](openspec/specs/iceberg_tables.md) | Iceberg table schema and partitioning design |
 | [`specs/celery_execution.md`](openspec/specs/celery_execution.md) | CeleryExecutor configuration and worker design |
 | [`specs/dashboard.md`](openspec/specs/dashboard.md) | Superset dashboard and visualization design |
+| [`specs/csv-auto-ingest.md`](openspec/specs/csv-auto-ingest.md) | CSV auto-ingest pipeline specification |
 
 ---
 
@@ -360,6 +417,7 @@ This project follows a spec-driven development methodology. Each major component
 ## Roadmap
 
 - **Incremental ingestion + CDC** -- watermark-based extraction and MERGE INTO for upsert semantics
+- **CSV auto-ingest** -- automatic schema inference and table creation from uploaded CSVs (in progress)
 - **Data quality checks** -- automated validation gates using Great Expectations or Soda
 - **CI/CD pipeline** -- GitHub Actions for linting, DAG validation, and integration testing
 - **Monitoring and observability** -- Prometheus metrics collection and Grafana dashboards

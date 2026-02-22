@@ -268,8 +268,8 @@ or business units from a single deployment.
 
 ```mermaid
 graph LR
-    P1["Phase 1<br/>Foundation<br/><b>Current</b>"]
-    P2["Phase 2<br/>Incremental Ingestion<br/>+ CDC"]
+    P1["Phase 1<br/>Foundation<br/><b>Complete</b>"]
+    P2["Phase 2<br/>Incremental Ingestion<br/>+ CDC<br/><b>In Progress</b>"]
     P3["Phase 3<br/>Data Quality<br/>Checks"]
     P4["Phase 4<br/>CI/CD<br/>Pipeline"]
     P5["Phase 5<br/>Monitoring &<br/>Observability"]
@@ -286,7 +286,7 @@ graph LR
     P5 --> P7
 
     style P1 fill:#22c55e,stroke:#16a34a,color:#fff
-    style P2 fill:#3b82f6,stroke:#2563eb,color:#fff
+    style P2 fill:#f59e0b,stroke:#d97706,color:#fff
     style P3 fill:#3b82f6,stroke:#2563eb,color:#fff
     style P4 fill:#3b82f6,stroke:#2563eb,color:#fff
     style P5 fill:#3b82f6,stroke:#2563eb,color:#fff
@@ -296,8 +296,8 @@ graph LR
 
 | Phase | Status | Dependencies |
 |-------|--------|-------------|
-| Phase 1: Foundation | **Current** | None |
-| Phase 2: Incremental Ingestion + CDC | Planned | Phase 1 |
+| Phase 1: Foundation | **Complete** | None |
+| Phase 2: Incremental Ingestion + CDC | **In Progress** (CSV auto-ingest) | Phase 1 |
 | Phase 3: Data Quality Checks | Planned | Phase 2 |
 | Phase 4: CI/CD Pipeline | Planned | Phase 1 |
 | Phase 5: Monitoring & Observability | Planned | Phase 1 |
