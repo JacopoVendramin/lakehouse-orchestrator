@@ -41,6 +41,8 @@ The platform runs seven core services on a single Docker bridge network. Apache 
 
 **Pipeline stages:** CSV → Airflow (validate + upload) → SeaweedFS (S3 object store) → Iceberg REST Catalog (table metadata) → Trino (distributed SQL) → Superset (visualization)
 
+> **New here?** Read the [End-to-End Walkthrough](WALKTHROUGH.md) for a hands-on guide to every feature, with step-by-step commands, Mermaid diagrams, and a troubleshooting FAQ.
+
 ---
 
 ## Why This Stack
