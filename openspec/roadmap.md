@@ -49,24 +49,25 @@ registration via Trino, and interactive dashboards in Superset.
 
 ---
 
-## Phase 2: Incremental Ingestion and Change Data Capture
+## Phase 2: Incremental Ingestion and Change Data Capture — Complete
 
 ### Description
 
 Extend the ingestion pipeline to support incremental loads and change data
-capture (CDC). Rather than re-ingesting entire files, the pipeline detects new
-or modified records and applies only the delta to the Iceberg table. This
-reduces processing time, storage waste, and Trino query overhead.
+capture (CDC). The pipeline now handles automated CSV ingestion with S3 event
+detection and supports MERGE INTO upsert semantics with watermark-based
+incremental extraction. New or modified records are applied as deltas to the
+Iceberg table, reducing processing time, storage waste, and Trino query
+overhead.
 
 ### Deliverables
 
-- Airflow DAG for incremental ingestion using watermark-based extraction (track
-  the last processed `ingestion_date` or row offset).
-- Iceberg MERGE INTO support for upsert semantics (insert new records, update
-  changed records).
+- Airflow DAG for automated CSV ingestion with S3 file-change detection
+  (`sales_pipeline`).
+- MERGE INTO upsert support via `order_id` as merge key.
+- Watermark-based incremental extraction using Airflow Variables.
+- Audit columns (`_source_file`, `_ingested_at`) on the sales table.
 - Deduplication logic based on `order_id` as the primary key.
-- Audit columns (`_ingested_at`, `_source_file`) added to the Iceberg table
-  for lineage tracking.
 - Optional: Debezium CDC connector for capturing changes from an upstream
   transactional database.
 
@@ -83,28 +84,33 @@ reduces processing time, storage waste, and Trino query overhead.
 
 ---
 
-## Phase 3: Data Quality Checks
+## Phase 3: Data Quality Checks — Complete
 
 ### Description
 
-Integrate automated data quality validation into the ingestion pipeline. Quality
-checks run after ingestion and before the data is promoted to the "trusted"
-layer. Failed checks halt downstream processing and generate alerts.
+Automated data quality validation integrated into the ingestion pipeline via a
+custom validation framework. Quality checks run after ingestion and before the
+data is promoted to the "trusted" layer. Failed checks halt downstream
+processing and generate alerts.
 
 ### Deliverables
 
-- Data quality framework integration (Great Expectations, Soda, or a custom
-  validation layer using PyArrow).
-- Quality check suite for the `sales` table:
+- Custom validation framework (`lib/quality_checks.py`) with 8 check types:
+  uniqueness, not_null, positive, range, accepted_values, no_future_dates,
+  row_count_range, and custom SQL.
+- `data_quality_checks` DAG with run → persist + gate pattern.
+- `_quality_results` Iceberg metadata table for historical analysis.
+- 8 checks for the `sales` table:
   - `order_id` uniqueness.
-  - `amount` is positive and within a reasonable range.
-  - `country` values belong to a known reference set.
-  - `ingestion_date` is not in the future.
-  - Row count is within expected bounds (no catastrophic data loss or
-    explosion).
+  - `order_id` not null.
+  - `amount` is positive.
+  - `amount` is within a reasonable range.
+  - `country` values belong to a known reference set (accepted_values).
+  - `ingestion_date` is not in the future (no_future_dates).
+  - Row count is within expected bounds (row_count_range).
 - Airflow task group that runs quality checks as a gate between ingestion and
   table promotion.
-- Quality check results persisted to a metadata table for historical analysis.
+- Quality check results persisted to the `_quality_results` metadata table.
 - Alerting on quality check failures (Airflow email/Slack callback).
 
 ### Acceptance Criteria
@@ -269,8 +275,8 @@ or business units from a single deployment.
 ```mermaid
 graph LR
     P1["Phase 1<br/>Foundation<br/><b>Complete</b>"]
-    P2["Phase 2<br/>Incremental Ingestion<br/>+ CDC<br/><b>In Progress</b>"]
-    P3["Phase 3<br/>Data Quality<br/>Checks"]
+    P2["Phase 2<br/>Incremental Ingestion<br/>+ CDC<br/><b>Complete</b>"]
+    P3["Phase 3<br/>Data Quality<br/>Checks<br/><b>Complete</b>"]
     P4["Phase 4<br/>CI/CD<br/>Pipeline"]
     P5["Phase 5<br/>Monitoring &<br/>Observability"]
     P6["Phase 6<br/>Iceberg<br/>Maintenance"]
@@ -286,8 +292,8 @@ graph LR
     P5 --> P7
 
     style P1 fill:#22c55e,stroke:#16a34a,color:#fff
-    style P2 fill:#f59e0b,stroke:#d97706,color:#fff
-    style P3 fill:#3b82f6,stroke:#2563eb,color:#fff
+    style P2 fill:#22c55e,stroke:#16a34a,color:#fff
+    style P3 fill:#22c55e,stroke:#16a34a,color:#fff
     style P4 fill:#3b82f6,stroke:#2563eb,color:#fff
     style P5 fill:#3b82f6,stroke:#2563eb,color:#fff
     style P6 fill:#3b82f6,stroke:#2563eb,color:#fff
@@ -297,8 +303,8 @@ graph LR
 | Phase | Status | Dependencies |
 |-------|--------|-------------|
 | Phase 1: Foundation | **Complete** | None |
-| Phase 2: Incremental Ingestion + CDC | **In Progress** (CSV auto-ingest) | Phase 1 |
-| Phase 3: Data Quality Checks | Planned | Phase 2 |
+| Phase 2: Incremental Ingestion + CDC | **Complete** | Phase 1 |
+| Phase 3: Data Quality Checks | **Complete** | Phase 2 |
 | Phase 4: CI/CD Pipeline | Planned | Phase 1 |
 | Phase 5: Monitoring & Observability | Planned | Phase 1 |
 | Phase 6: Iceberg Maintenance | Planned | Phase 2 |

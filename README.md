@@ -138,13 +138,14 @@ docker compose exec airflow-webserver airflow dags unpause csv_to_iceberg_pipeli
 docker compose exec airflow-webserver airflow dags trigger csv_to_iceberg_pipeline
 ```
 
-The pipeline executes five sequential tasks:
+The pipeline executes six sequential tasks using incremental upsert semantics:
 
 1. **validate_csv_schema** -- confirms the CSV matches the expected column contract
 2. **upload_csv_to_s3** -- uploads the raw file to SeaweedFS for durability
 3. **create_iceberg_namespace** -- creates the `iceberg.lakehouse` schema in Trino
-4. **create_iceberg_table** -- creates the partitioned Iceberg table (Parquet format, partitioned by `ingestion_date`)
-5. **insert_data_into_iceberg** -- loads rows using a delete-then-insert pattern for idempotency
+4. **create_iceberg_table** -- creates the partitioned Iceberg table (Parquet format, partitioned by `ingestion_date`) with audit columns (`_source_file`, `_ingested_at`)
+5. **upsert_data_into_iceberg** -- uses MERGE INTO with `order_id` as the merge key for upsert semantics; only rows newer than the current watermark are extracted from the CSV (watermark-based incremental extraction via Airflow Variables)
+6. **update_watermark** -- advances the Airflow Variable watermark to the highest `ingestion_date` processed in this run
 
 Monitor progress in the Airflow UI at [http://localhost:8081](http://localhost:8081) or watch Celery worker activity in Flower at [http://localhost:5555](http://localhost:5555).
 
@@ -195,6 +196,38 @@ The `csv_auto_ingest` DAG polls the `s3://csv-uploads` bucket every 5 minutes fo
 | Audit columns | `_source_file` and `_ingested_at` added to every row |
 | Superset auto-registration | New tables are automatically registered as Superset datasets |
 | Parallel processing | Multiple files processed concurrently via CeleryExecutor |
+
+### Data Quality Checks (Automatic Gate)
+
+The `data_quality_checks` DAG runs automated validations against the `sales` table after ingestion. Failed checks halt downstream processing and generate visible failures in the Airflow UI.
+
+**Usage:**
+
+1. Unpause the DAG:
+   ```bash
+   docker compose exec airflow-webserver airflow dags unpause data_quality_checks
+   ```
+
+2. The DAG runs daily on schedule or can be triggered manually:
+   ```bash
+   docker compose exec airflow-webserver airflow dags trigger data_quality_checks
+   ```
+
+3. Query check results in Trino:
+   ```sql
+   SELECT * FROM iceberg.lakehouse._quality_results ORDER BY executed_at DESC;
+   ```
+
+**Features:**
+
+| Feature | Details |
+|---------|---------|
+| Check types | uniqueness, not_null, accepted_values, positive, range, row_count_range, no_future_dates, custom_sql |
+| Sales checks | 8 automated checks (order_id uniqueness, amount positive, country validation, etc.) |
+| Gate task | Raises AirflowFailException on any failed check |
+| Results persistence | All results stored in `_quality_results` Iceberg table |
+| Queryable history | Results queryable via Trino and visualizable in Superset |
+| Extensible | Add checks for any table via declarative QualityCheck definitions |
 
 ---
 
@@ -315,11 +348,13 @@ lakehouse-orchestrator/
 │   ├── dags/
 │   │   ├── csv_to_iceberg_celery.py   # Ingestion DAG: CSV → S3 → Iceberg
 │   │   ├── csv_auto_ingest.py         # Auto-ingest DAG: S3 polling → schema inference → Iceberg
+│   │   ├── data_quality_checks.py     # Quality gate DAG: validations → persist + gate
 │   │   └── lib/
 │   │       ├── __init__.py
 │   │       ├── type_inference.py      # Column type detection engine
 │   │       ├── schema_manager.py      # DDL generation and schema evolution
-│   │       └── superset_client.py     # Superset dataset auto-registration
+│   │       ├── superset_client.py     # Superset dataset auto-registration
+│   │       └── quality_checks.py      # Data quality validation framework
 │   ├── plugins/                        # Custom Airflow plugins (extensible)
 │   ├── Dockerfile                      # Custom Airflow image (boto3, trino, celery)
 │   └── requirements.txt               # Python dependencies (unpinned; managed by Airflow constraints)
@@ -332,6 +367,7 @@ lakehouse-orchestrator/
 │   └── specs/
 │       ├── celery_execution.md        # CeleryExecutor design spec
 │       ├── dashboard.md               # Superset dashboard spec
+│       ├── data-quality.md            # Data quality checks spec
 │       ├── iceberg_tables.md          # Iceberg table design spec
 │       ├── ingestion.md               # Ingestion pipeline spec
 │       └── storage_layer.md           # Storage layer spec
@@ -388,6 +424,7 @@ This project follows a spec-driven development methodology. Each major component
 | [`specs/celery_execution.md`](openspec/specs/celery_execution.md) | CeleryExecutor configuration and worker design |
 | [`specs/dashboard.md`](openspec/specs/dashboard.md) | Superset dashboard and visualization design |
 | [`specs/csv-auto-ingest.md`](openspec/specs/csv-auto-ingest.md) | CSV auto-ingest pipeline specification |
+| [`specs/data-quality.md`](openspec/specs/data-quality.md) | Data quality checks specification |
 
 ---
 
@@ -397,28 +434,27 @@ This project follows a spec-driven development methodology. Each major component
 
 | Limitation | Description |
 |-----------|-------------|
-| **Single-file ingestion** | The DAG reads only `data/raw/sales_sample.csv`. Additional CSV files in the directory are ignored. |
+| **Single-file ingestion (sales pipeline)** | The sales pipeline DAG reads only `data/raw/sales_sample.csv`. Additional CSV files in the directory are ignored. The auto-ingest pipeline handles arbitrary files via S3 upload. |
 | **No orphan date cleanup** | If all rows for a specific `ingestion_date` are removed from the CSV and the DAG is re-run, the old data for that date remains in the Iceberg table. The delete-then-insert strategy only processes dates *present* in the current CSV. |
-| **Row-by-row INSERT** | Data is inserted one row at a time via parameterized Trino queries. Acceptable for the sample dataset but would be a bottleneck at scale. |
 | **No Airflow Connections** | S3 and Trino connections are built directly from environment variables, bypassing Airflow's connection management UI. |
 
 ### Re-run Behaviour
 
 | Scenario | Result |
 |----------|--------|
-| Re-run with identical CSV | Idempotent. Same rows are deleted and re-inserted. |
-| Remove some rows for a date (other rows for that date remain) | Correct. The date's rows are replaced with the CSV's current content. |
-| Remove all rows for a specific date | **Stale data remains.** The date is no longer in the CSV, so no DELETE is issued. |
-| Add rows with new dates | Correct. New dates are inserted, existing dates are refreshed. |
-| Add a new CSV file to `data/raw/` | **Ignored.** Only `sales_sample.csv` is processed. |
+| Re-run with identical CSV | Idempotent. MERGE INTO updates existing rows with same values. |
+| Change amount for existing order_id | Updated in-place via MERGE INTO WHEN MATCHED. |
+| Add rows with new order_ids | Inserted via MERGE INTO WHEN NOT MATCHED. |
+| Add rows with new dates | Inserted. Watermark advances to highest date. |
+| Re-run after watermark set | Only rows newer than watermark are processed. |
 
 ---
 
 ## Roadmap
 
-- **Incremental ingestion + CDC** -- watermark-based extraction and MERGE INTO for upsert semantics
-- **CSV auto-ingest** -- automatic schema inference and table creation from uploaded CSVs (in progress)
-- **Data quality checks** -- automated validation gates using Great Expectations or Soda
+- **Incremental upsert + watermark** -- watermark-based extraction and MERGE INTO for upsert semantics (complete)
+- **CSV auto-ingest** -- automatic schema inference and table creation from uploaded CSVs (complete)
+- **Data quality checks** -- automated validation gates with declarative check definitions (complete)
 - **CI/CD pipeline** -- GitHub Actions for linting, DAG validation, and integration testing
 - **Monitoring and observability** -- Prometheus metrics collection and Grafana dashboards
 - **Iceberg compaction + maintenance** -- automated snapshot expiry, orphan cleanup, and file compaction
