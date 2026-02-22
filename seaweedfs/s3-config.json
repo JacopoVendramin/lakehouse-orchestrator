@@ -1,0 +1,29 @@
+{
+  "identities": [
+    {
+      "name": "lakehouse_admin",
+      "credentials": [
+        {
+          "accessKey": "lakehouse_access_key",
+          "secretKey": "lakehouse_secret_key"
+        }
+      ],
+      "actions": [
+        "Admin",
+        "Read",
+        "Write",
+        "List",
+        "Tagging",
+        "Lock"
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "id": "lakehouse",
+      "displayName": "Lakehouse Platform",
+      "emailAddress": "admin@lakehouse.local",
+      "userName": "lakehouse_admin"
+    }
+  ]
+}
