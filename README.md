@@ -119,6 +119,8 @@ Once all services report `healthy` or `running`, open the interfaces listed in t
 | SeaweedFS Filer | [http://localhost:8888](http://localhost:8888) | 8888 | -- |
 | Iceberg REST Catalog | [http://localhost:8181](http://localhost:8181) | 8181 | -- |
 | PostgreSQL | `localhost:5432` | 5432 | `airflow` / `airflow` |
+| Prometheus | [http://localhost:9090](http://localhost:9090) | 9090 | -- |
+| Grafana | [http://localhost:3000](http://localhost:3000) | 3000 | `admin` / `admin` |
 
 All ports are configurable via environment variables in `.env`.
 
@@ -228,6 +230,55 @@ The `data_quality_checks` DAG runs automated validations against the `sales` tab
 | Results persistence | All results stored in `_quality_results` Iceberg table |
 | Queryable history | Results queryable via Trino and visualizable in Superset |
 | Extensible | Add checks for any table via declarative QualityCheck definitions |
+
+### Monitoring & Observability
+
+Prometheus scrapes metrics from all platform services through dedicated exporters:
+
+| Exporter | Metrics Source |
+|----------|---------------|
+| StatsD Exporter | Airflow CeleryExecutor (DAG runs, task duration, scheduler heartbeat) |
+| PostgreSQL Exporter | Connection count, cache hit ratio, query latency |
+| Valkey Exporter | Memory usage, connected clients, command throughput |
+| SeaweedFS (native) | Volume server health, storage capacity, S3 request rates |
+
+Grafana is auto-provisioned on first boot with a **"Lakehouse Platform Overview"** dashboard containing 10 panels. No manual configuration is required -- the datasource, dashboard JSON, and alerting rules are all provisioned via Grafana's provisioning API.
+
+**5 alerting rules** are pre-configured:
+
+1. Airflow task failure rate exceeds threshold
+2. PostgreSQL connection count exceeds 80% of max
+3. PostgreSQL cache hit ratio drops below 95%
+4. Valkey memory usage exceeds 80%
+5. SeaweedFS volume server down
+
+Access Grafana at [http://localhost:3000](http://localhost:3000) (default credentials: `admin` / `admin`).
+
+### Iceberg Table Maintenance
+
+The `iceberg_maintenance` DAG automates Iceberg table maintenance to prevent storage bloat and maintain query performance. It runs daily at 3 AM UTC and dynamically discovers all tables in the `iceberg.lakehouse` schema.
+
+**Operations per table:**
+
+| Operation | Description |
+|-----------|-------------|
+| `optimize` | Compacts small Parquet files into larger files for better scan performance |
+| `expire_snapshots` | Removes snapshots older than 7 days to free storage |
+| `remove_orphan_files` | Deletes data files not referenced by any current snapshot |
+
+Dynamic task mapping ensures newly created tables are automatically maintained without any DAG changes. All results are tracked in the `_maintenance_log` Iceberg table.
+
+**Usage:**
+
+```bash
+docker compose exec airflow-webserver airflow dags unpause iceberg_maintenance
+```
+
+**Query maintenance history:**
+
+```sql
+SELECT * FROM iceberg.lakehouse._maintenance_log ORDER BY executed_at DESC;
+```
 
 ---
 
@@ -349,18 +400,32 @@ lakehouse-orchestrator/
 │   │   ├── csv_to_iceberg_celery.py   # Ingestion DAG: CSV → S3 → Iceberg
 │   │   ├── csv_auto_ingest.py         # Auto-ingest DAG: S3 polling → schema inference → Iceberg
 │   │   ├── data_quality_checks.py     # Quality gate DAG: validations → persist + gate
+│   │   ├── iceberg_maintenance.py     # Maintenance DAG: compaction, snapshot expiry, orphan cleanup
 │   │   └── lib/
 │   │       ├── __init__.py
 │   │       ├── type_inference.py      # Column type detection engine
 │   │       ├── schema_manager.py      # DDL generation and schema evolution
 │   │       ├── superset_client.py     # Superset dataset auto-registration
-│   │       └── quality_checks.py      # Data quality validation framework
+│   │       ├── quality_checks.py      # Data quality validation framework
+│   │       └── iceberg_maintenance.py # Iceberg maintenance operations library
 │   ├── plugins/                        # Custom Airflow plugins (extensible)
 │   ├── Dockerfile                      # Custom Airflow image (boto3, trino, celery)
 │   └── requirements.txt               # Python dependencies (unpinned; managed by Airflow constraints)
 ├── data/
 │   └── raw/
 │       └── sales_sample.csv           # Sample dataset (~200 records, 10 countries, 30 days)
+├── monitoring/
+│   ├── prometheus/
+│   │   ├── prometheus.yml             # Prometheus scrape configuration for all services
+│   │   └── alert_rules.yml            # Alerting rules (5 rules)
+│   └── grafana/
+│       ├── provisioning/              # Datasource and dashboard provisioning config
+│       │   ├── datasources/
+│       │   │   └── prometheus.yml     # Prometheus datasource auto-provisioning
+│       │   └── dashboards/
+│       │       └── dashboards.yml     # Dashboard provider configuration
+│       └── dashboards/
+│           └── lakehouse-overview.json # Lakehouse Platform Overview dashboard (10 panels)
 ├── openspec/
 │   ├── architecture.md                # Architecture specification
 │   ├── roadmap.md                     # Phased project roadmap
@@ -369,7 +434,9 @@ lakehouse-orchestrator/
 │       ├── dashboard.md               # Superset dashboard spec
 │       ├── data-quality.md            # Data quality checks spec
 │       ├── iceberg_tables.md          # Iceberg table design spec
+│       ├── iceberg-maintenance.md     # Iceberg maintenance spec
 │       ├── ingestion.md               # Ingestion pipeline spec
+│       ├── monitoring.md              # Monitoring and observability spec
 │       └── storage_layer.md           # Storage layer spec
 ├── postgres/
 │   └── init-superset-db.sh            # Creates Superset database on first boot (env-driven)
@@ -425,6 +492,8 @@ This project follows a spec-driven development methodology. Each major component
 | [`specs/dashboard.md`](openspec/specs/dashboard.md) | Superset dashboard and visualization design |
 | [`specs/csv-auto-ingest.md`](openspec/specs/csv-auto-ingest.md) | CSV auto-ingest pipeline specification |
 | [`specs/data-quality.md`](openspec/specs/data-quality.md) | Data quality checks specification |
+| [`specs/monitoring.md`](openspec/specs/monitoring.md) | Monitoring and observability specification |
+| [`specs/iceberg-maintenance.md`](openspec/specs/iceberg-maintenance.md) | Iceberg table maintenance specification |
 
 ---
 
@@ -456,8 +525,8 @@ This project follows a spec-driven development methodology. Each major component
 - **CSV auto-ingest** -- automatic schema inference and table creation from uploaded CSVs (complete)
 - **Data quality checks** -- automated validation gates with declarative check definitions (complete)
 - **CI/CD pipeline** -- GitHub Actions for linting, DAG validation, and integration testing
-- **Monitoring and observability** -- Prometheus metrics collection and Grafana dashboards
-- **Iceberg compaction + maintenance** -- automated snapshot expiry, orphan cleanup, and file compaction
+- **Monitoring and observability** -- Prometheus metrics collection and Grafana dashboards (complete)
+- **Iceberg compaction + maintenance** -- automated snapshot expiry, orphan cleanup, and file compaction (complete)
 - **Multi-tenant support** -- schema-level isolation, tenant provisioning, and row-level security
 
 See [`openspec/roadmap.md`](openspec/roadmap.md) for detailed phase descriptions and acceptance criteria.

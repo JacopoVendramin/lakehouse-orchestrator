@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: default
+    type: file
+    folder: Lakehouse
+    options:
+      path: /var/lib/grafana/dashboards
+    disableDeletion: false
+    editable: true
