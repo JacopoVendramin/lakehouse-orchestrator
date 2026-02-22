@@ -96,14 +96,22 @@ separate identities with scoped permissions should be created for each client
 SeaweedFS uses a four-component architecture, each deployed as a separate
 container:
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│    Master     │────▶│    Volume     │     │    Filer      │────▶│  S3 Gateway  │
-│   :9333       │     │   :8080       │     │   :8888       │     │   :8333       │
-│               │     │               │     │               │     │               │
-│  Topology &   │     │  Blob store   │     │  File-to-chunk│     │  S3 API       │
-│  volume IDs   │     │  (actual data)│     │  mapping      │     │  translation  │
-└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+```mermaid
+graph LR
+    subgraph SeaweedFS
+        Master["Master<br/>:9333<br/>Topology &<br/>volume IDs"]
+        Volume["Volume<br/>:8080<br/>Blob store<br/>(actual data)"]
+        Filer["Filer<br/>:8888<br/>File-to-chunk<br/>mapping"]
+        S3GW["S3 Gateway<br/>:8333<br/>S3 API<br/>translation"]
+    end
+
+    Master --> Volume
+    Filer --> Volume
+    S3GW --> Filer
+
+    Airflow["Airflow Worker<br/>(boto3)"] -->|PutObject| S3GW
+    Trino["Trino<br/>(native S3)"] -->|GetObject| S3GW
+    Iceberg["Iceberg Catalog<br/>(S3FileIO)"] -->|Read/Write| S3GW
 ```
 
 | Component | Container | Responsibility |
@@ -115,8 +123,14 @@ container:
 
 ### Startup Order
 
-```
-master → volume → filer → s3 (gateway) → s3-init (bucket creation)
+```mermaid
+flowchart LR
+    M["Master"] --> V["Volume"]
+    V --> F["Filer"]
+    F --> S3["S3 Gateway"]
+    S3 --> Init["s3-init<br/>(bucket creation)"]
+
+    style Init fill:#f59e0b,stroke:#d97706,color:#fff
 ```
 
 Each component depends on the previous one. Docker Compose `depends_on`
@@ -168,15 +182,26 @@ s3://lakehouse/raw/sales/sales_sample.parquet
 
 ### Iceberg Warehouse (`lakehouse-warehouse` bucket)
 
-```
-s3://lakehouse-warehouse/<schema>/<table>/
-├── data/
-│   └── <partition>/
-│       └── <data-file>.parquet
-└── metadata/
-    ├── v<N>.metadata.json
-    ├── snap-<snapshot-id>.avro
-    └── <manifest-id>.avro
+```mermaid
+graph TB
+    Bucket["s3://lakehouse-warehouse/"]
+    Schema["schema/"]
+    Table["table/"]
+    DataDir["data/"]
+    MetaDir["metadata/"]
+    Part["partition=/"]
+    Parquet["data-file.parquet"]
+    MetaJSON["vN.metadata.json"]
+    Snap["snap-id.avro"]
+    Manifest["manifest-id.avro"]
+
+    Bucket --> Schema --> Table
+    Table --> DataDir
+    Table --> MetaDir
+    DataDir --> Part --> Parquet
+    MetaDir --> MetaJSON
+    MetaDir --> Snap
+    MetaDir --> Manifest
 ```
 
 Iceberg manages the internal directory structure. The naming convention within

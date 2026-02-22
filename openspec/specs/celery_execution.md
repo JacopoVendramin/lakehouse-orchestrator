@@ -22,6 +22,26 @@ consume these messages and execute the corresponding Python callables.
 This separation of concerns allows the scheduler, webserver, and workers to
 scale independently and fail independently without cascading failures.
 
+### Task Execution Flow
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant V as Valkey (Broker)
+    participant W as Worker (Celery)
+    participant PG as PostgreSQL (Result Backend)
+    participant F as Flower (Monitor)
+
+    S->>S: Parse DAGs & create task instances
+    S->>V: Publish task message
+    V->>W: Deliver task message
+    W->>W: Execute Python callable
+    W->>PG: Persist task result & state
+    W->>V: Acknowledge message
+    W-->>F: Heartbeat & task status
+    F-->>F: Display worker stats in UI
+```
+
 ### Components Involved
 
 | Component | Container | Role |
@@ -128,6 +148,31 @@ The default deployment includes a single Celery worker
 single-pipeline workloads.
 
 ### Horizontal Scaling
+
+```mermaid
+graph TB
+    Scheduler["Airflow Scheduler"]
+    Valkey["Valkey Broker<br/>:6379"]
+    PG["PostgreSQL<br/>(result backend)"]
+    Flower["Flower<br/>:5555"]
+
+    W1["Worker 1"]
+    W2["Worker 2"]
+    W3["Worker 3"]
+
+    Scheduler -->|publish tasks| Valkey
+    Valkey -->|consume| W1
+    Valkey -->|consume| W2
+    Valkey -->|consume| W3
+
+    W1 -->|results| PG
+    W2 -->|results| PG
+    W3 -->|results| PG
+
+    W1 -.->|heartbeat| Flower
+    W2 -.->|heartbeat| Flower
+    W3 -.->|heartbeat| Flower
+```
 
 ```bash
 docker compose up --scale airflow-worker=3 -d

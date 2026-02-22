@@ -266,6 +266,34 @@ or business units from a single deployment.
 
 ## Timeline Summary
 
+```mermaid
+graph LR
+    P1["Phase 1<br/>Foundation<br/><b>Current</b>"]
+    P2["Phase 2<br/>Incremental Ingestion<br/>+ CDC"]
+    P3["Phase 3<br/>Data Quality<br/>Checks"]
+    P4["Phase 4<br/>CI/CD<br/>Pipeline"]
+    P5["Phase 5<br/>Monitoring &<br/>Observability"]
+    P6["Phase 6<br/>Iceberg<br/>Maintenance"]
+    P7["Phase 7<br/>Multi-Tenant<br/>Support"]
+
+    P1 --> P2
+    P1 --> P4
+    P1 --> P5
+    P2 --> P3
+    P2 --> P6
+    P3 --> P7
+    P4 --> P7
+    P5 --> P7
+
+    style P1 fill:#22c55e,stroke:#16a34a,color:#fff
+    style P2 fill:#3b82f6,stroke:#2563eb,color:#fff
+    style P3 fill:#3b82f6,stroke:#2563eb,color:#fff
+    style P4 fill:#3b82f6,stroke:#2563eb,color:#fff
+    style P5 fill:#3b82f6,stroke:#2563eb,color:#fff
+    style P6 fill:#3b82f6,stroke:#2563eb,color:#fff
+    style P7 fill:#3b82f6,stroke:#2563eb,color:#fff
+```
+
 | Phase | Status | Dependencies |
 |-------|--------|-------------|
 | Phase 1: Foundation | **Current** | None |

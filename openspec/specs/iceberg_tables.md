@@ -13,6 +13,28 @@ through Trino.
 
 ## Context
 
+```mermaid
+graph TB
+    subgraph Trino["Trino Query Engine"]
+        IC["Iceberg Connector"]
+    end
+
+    subgraph Catalog["Iceberg REST Catalog :8181"]
+        Meta["Table metadata<br/>Schema, Snapshots,<br/>Partition specs"]
+    end
+
+    subgraph S3["SeaweedFS S3 :8333"]
+        Data["Parquet data files"]
+        ManifestFiles["Manifest files (.avro)"]
+        MetadataJSON["Metadata files (.json)"]
+    end
+
+    IC -->|REST API| Meta
+    IC -->|S3 API| Data
+    Meta -->|S3 FileIO| ManifestFiles
+    Meta -->|S3 FileIO| MetadataJSON
+```
+
 Apache Iceberg is an open table format that brings ACID transactions,
 schema evolution, and time travel to data lakes. In this platform, Iceberg
 tables are the authoritative analytical representation of ingested data.
@@ -111,18 +133,20 @@ containing one or more Parquet data files.
 
 ### Physical Layout on S3
 
-```
-s3://lakehouse-warehouse/lakehouse/sales/
-├── data/
-│   ├── ingestion_date=2024-01-15/
-│   │   └── 00000-0-<uuid>.parquet
-│   ├── ingestion_date=2024-01-16/
-│   │   └── 00000-0-<uuid>.parquet
-│   └── ...
-└── metadata/
-    ├── v1.metadata.json
-    ├── snap-<id>-<uuid>.avro
-    └── <uuid>-m0.avro
+```mermaid
+graph TB
+    subgraph bucket["s3://lakehouse-warehouse/lakehouse/sales/"]
+        subgraph data["data/"]
+            P1["ingestion_date=2024-01-15/<br/>00000-0-uuid.parquet"]
+            P2["ingestion_date=2024-01-16/<br/>00000-0-uuid.parquet"]
+            P3["..."]
+        end
+        subgraph metadata["metadata/"]
+            M1["v1.metadata.json"]
+            M2["snap-id-uuid.avro"]
+            M3["uuid-m0.avro"]
+        end
+    end
 ```
 
 ---
@@ -172,6 +196,24 @@ After this operation:
 ## Time Travel and Snapshot Isolation
 
 ### Snapshot Model
+
+```mermaid
+graph LR
+    S1["Snapshot 1<br/>(initial load)"]
+    S2["Snapshot 2<br/>(INSERT)"]
+    S3["Snapshot 3<br/>(UPDATE)"]
+    Current["Current<br/>table state"]
+
+    S1 --> S2 --> S3 --> Current
+
+    S1 -.- ML1["Manifest List 1"]
+    S2 -.- ML2["Manifest List 2"]
+    S3 -.- ML3["Manifest List 3"]
+
+    ML1 -.- MF1["Manifest → Parquet files"]
+    ML2 -.- MF2["Manifest → Parquet files"]
+    ML3 -.- MF3["Manifest → Parquet files"]
+```
 
 Every write operation (INSERT, DELETE, UPDATE) creates a new snapshot. Each
 snapshot is an immutable, complete view of the table at a point in time. Iceberg

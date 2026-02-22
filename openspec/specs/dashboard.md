@@ -13,6 +13,26 @@ trends.
 
 ## Context
 
+```mermaid
+sequenceDiagram
+    participant User as User (Browser)
+    participant SS as Superset :8088
+    participant T as Trino :8080
+    participant IC as Iceberg REST Catalog
+    participant S3 as SeaweedFS S3
+
+    User->>SS: Open dashboard
+    SS->>T: SQL query via sqlalchemy-trino
+    T->>IC: Resolve table metadata
+    IC->>S3: Read metadata files
+    S3-->>IC: Metadata response
+    IC-->>T: Table schema & manifest list
+    T->>S3: Read Parquet data files
+    S3-->>T: Data response
+    T-->>SS: Query result set
+    SS-->>User: Rendered charts & filters
+```
+
 Apache Superset is the visualisation layer of the lakehouse platform. It
 connects to Trino via the `sqlalchemy-trino` driver, which is installed in a
 custom Docker image built from `superset/Dockerfile`. On first startup, a
@@ -23,6 +43,18 @@ bootstrap script (`superset/bootstrap.sh`) automatically:
 3. Initialises default roles and permissions.
 4. Registers the Trino datasource.
 5. Starts Gunicorn on port 8088.
+
+### Bootstrap Sequence
+
+```mermaid
+flowchart TD
+    Start["Container starts"] --> Wait["Wait for PostgreSQL<br/>(30 retries, 2s interval)"]
+    Wait --> Migrate["superset db upgrade<br/>(schema migrations)"]
+    Migrate --> Admin["superset fab create-admin<br/>(idempotent)"]
+    Admin --> Init["superset init<br/>(roles & permissions)"]
+    Init --> DS["superset set-database-uri<br/>(register Trino datasource)"]
+    DS --> Gunicorn["Start Gunicorn<br/>(4 workers, port 8088)"]
+```
 
 This self-provisioning design means Superset is fully operational after
 `docker compose up` without manual configuration.
@@ -85,14 +117,17 @@ URI. If it does not exist, it creates a new database entry.
 
 ### Driver Installation
 
-The `superset/Dockerfile` installs the Trino driver:
+The `superset/Dockerfile` installs the Trino driver and PostgreSQL adapter into
+the application's `uv`-managed virtual environment:
 
 ```dockerfile
-RUN pip install --no-cache-dir sqlalchemy-trino
+RUN uv pip install --python /app/.venv/bin/python --no-cache sqlalchemy-trino psycopg2-binary
 ```
 
-No additional configuration is required. SQLAlchemy auto-discovers the `trino`
-dialect from the installed package.
+`psycopg2-binary` is required because Superset uses a `postgresql+psycopg2://`
+URI to connect to its metadata database. The `--python` flag ensures packages
+are installed into the correct venv (`/app/.venv/`), which the base image
+creates with `include-system-site-packages = false`.
 
 ---
 
@@ -194,20 +229,25 @@ by country over time.
 The recommended dashboard layout organises charts for an executive-level
 overview:
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  Filters: [ Date Range ] [ Country ]                       │
-├──────────────────────────┬─────────────────────────────────┤
-│                          │                                 │
-│   Revenue by Country     │   Daily Revenue Trend           │
-│   (bar chart)            │   (line chart)                  │
-│                          │                                 │
-├──────────────────────────┼─────────────────────────────────┤
-│                          │                                 │
-│   Top 10 Customers       │   Revenue by Country & Date     │
-│   (table)                │   (stacked area chart)          │
-│                          │                                 │
-└──────────────────────────┴─────────────────────────────────┘
+```mermaid
+block-beta
+    columns 2
+    block:filters:2
+        F1["Filter: Date Range"]
+        F2["Filter: Country"]
+    end
+    block:topL
+        C1["Revenue by Country<br/>(bar chart)"]
+    end
+    block:topR
+        C2["Daily Revenue Trend<br/>(line chart)"]
+    end
+    block:botL
+        C3["Top 10 Customers<br/>(table)"]
+    end
+    block:botR
+        C4["Revenue by Country & Date<br/>(stacked area chart)"]
+    end
 ```
 
 ### Filter Bar
@@ -233,9 +273,11 @@ in a separate PostgreSQL database:
 | Port | `5432` |
 | SQLAlchemy URI | `postgresql+psycopg2://superset:superset@postgres:5432/superset` |
 
-The database and user are created by `postgres/init-superset-db.sql`, which
+The database and user are created by `postgres/init-superset-db.sh`, which
 runs automatically on the first PostgreSQL startup via
-`docker-entrypoint-initdb.d`.
+`docker-entrypoint-initdb.d`. The script reads credentials from environment
+variables (`SUPERSET_DB_USER`, `SUPERSET_DB_PASSWORD`, `SUPERSET_DB_NAME`),
+ensuring the password stays in sync with `.env` and `docker-compose.yml`.
 
 ---
 

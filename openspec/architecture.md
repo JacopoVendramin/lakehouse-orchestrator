@@ -18,63 +18,56 @@ removed in production.
 
 ## Architecture Diagram
 
-```
- ┌──────────────────────────────────────────────────────────────────────────────┐
- │                        lakehouse-network (bridge)                           │
- │                                                                             │
- │  ┌─────────────┐        ┌─────────────────────────────────────────────────┐ │
- │  │  CSV Files   │        │              Apache Airflow                    │ │
- │  │  (./data/)   │───────▶│  ┌───────────┐ ┌───────────┐ ┌─────────────┐  │ │
- │  └─────────────┘        │  │ Scheduler  │ │ Webserver │ │   Worker    │  │ │
- │                          │  │            │ │  :8081    │ │  (Celery)   │  │ │
- │                          │  └─────┬──────┘ └───────────┘ └──────┬──────┘  │ │
- │                          │        │                             │         │ │
- │                          │        └──────────┬──────────────────┘         │ │
- │                          │                   │                            │ │
- │                          │              ┌────▼────┐                       │ │
- │                          │              │ Flower  │                       │ │
- │                          │              │  :5555  │                       │ │
- │                          │              └─────────┘                       │ │
- │                          └───────────────────┬───────────────────────────┘ │
- │                                              │                             │
- │               ┌──────────────────────────────┼──────────────────┐          │
- │               │                              │                  │          │
- │               ▼                              ▼                  ▼          │
- │  ┌────────────────────┐        ┌──────────────────┐   ┌────────────────┐  │
- │  │     PostgreSQL      │        │      Valkey       │   │   SeaweedFS    │  │
- │  │    (metadata DB)    │        │    (broker)       │   │  (S3 storage)  │  │
- │  │      :5432          │        │      :6379        │   │                │  │
- │  │                     │        └──────────────────┘   │ ┌────────────┐ │  │
- │  │ ┌───────┐ ┌───────┐│                               │ │   Master   │ │  │
- │  │ │airflow│ │superse││                               │ │   :9333    │ │  │
- │  │ │  db   │ │ t db  ││                               │ ├────────────┤ │  │
- │  │ └───────┘ └───────┘│                               │ │   Volume   │ │  │
- │  └────────────────────┘                               │ │   :8082    │ │  │
- │                                                        │ ├────────────┤ │  │
- │                                                        │ │   Filer    │ │  │
- │                                                        │ │   :8888    │ │  │
- │                                                        │ ├────────────┤ │  │
- │                                                        │ │ S3 Gateway │ │  │
- │                                                        │ │   :8333    │ │  │
- │                                                        │ └────────────┘ │  │
- │                                                        └───────┬────────┘  │
- │                                                                │           │
- │                                                                │ S3 API    │
- │                                                                │           │
- │                                                        ┌───────▼────────┐  │
- │                                                        │     Trino      │  │
- │                                                        │ (query engine) │  │
- │                                                        │     :8083      │  │
- │                                                        └───────┬────────┘  │
- │                                                                │           │
- │                                                                │ JDBC/SQL  │
- │                                                                │           │
- │                                                        ┌───────▼────────┐  │
- │                                                        │    Superset    │  │
- │                                                        │  (dashboards)  │  │
- │                                                        │     :8088      │  │
- │                                                        └────────────────┘  │
- └──────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph net["lakehouse-network (bridge)"]
+        subgraph airflow["Apache Airflow"]
+            CSV["CSV Files<br/>(./data/)"]
+            Scheduler["Scheduler"]
+            Webserver["Webserver<br/>:8081"]
+            Worker["Worker<br/>(Celery)"]
+            Flower["Flower<br/>:5555"]
+        end
+
+        CSV --> Scheduler
+        Scheduler --> Worker
+        Worker --> Flower
+
+        subgraph pg["PostgreSQL :5432"]
+            airflowdb["airflow db"]
+            supersetdb["superset db"]
+        end
+
+        Valkey["Valkey<br/>(broker)<br/>:6379"]
+
+        subgraph seaweedfs["SeaweedFS (S3 storage)"]
+            Master["Master :9333"]
+            Volume["Volume :8082"]
+            Filer["Filer :8888"]
+            S3GW["S3 Gateway :8333"]
+        end
+
+        IcebergREST["Iceberg REST Catalog<br/>:8181"]
+
+        Trino["Trino<br/>(query engine)<br/>:8083"]
+        Superset["Superset<br/>(dashboards)<br/>:8088"]
+
+        Worker -->|metadata| pg
+        Worker -->|task queue| Valkey
+        Worker -->|S3 upload| S3GW
+        Worker -->|DDL/DML| Trino
+
+        Master --> Volume
+        Filer --> Volume
+        S3GW --> Filer
+
+        Trino -->|S3 API| S3GW
+        Trino -->|catalog| IcebergREST
+        IcebergREST -->|S3 API| S3GW
+
+        Superset -->|SQL| Trino
+        Superset -->|metadata| pg
+    end
 ```
 
 ---
@@ -83,9 +76,13 @@ removed in production.
 
 The platform implements a linear data pipeline with clear stage boundaries:
 
-```
-CSV  ──▶  Airflow  ──▶  SeaweedFS (S3)  ──▶  Iceberg Table  ──▶  Trino  ──▶  Superset
-(raw)    (ingest)      (object store)       (table format)     (query)     (visualise)
+```mermaid
+flowchart LR
+    CSV["CSV<br/>(raw)"] --> Airflow["Airflow<br/>(ingest)"]
+    Airflow --> S3["SeaweedFS S3<br/>(object store)"]
+    S3 --> Iceberg["Iceberg Table<br/>(table format)"]
+    Iceberg --> Trino["Trino<br/>(query)"]
+    Trino --> Superset["Superset<br/>(visualise)"]
 ```
 
 ### Stage Breakdown

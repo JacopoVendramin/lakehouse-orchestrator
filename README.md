@@ -247,7 +247,7 @@ lakehouse-orchestrator/
 │   │   └── csv_to_iceberg_celery.py   # Ingestion DAG: CSV → S3 → Iceberg
 │   ├── plugins/                        # Custom Airflow plugins (extensible)
 │   ├── Dockerfile                      # Custom Airflow image (boto3, trino, celery)
-│   └── requirements.txt               # Pinned Python dependencies
+│   └── requirements.txt               # Python dependencies (unpinned; managed by Airflow constraints)
 ├── data/
 │   └── raw/
 │       └── sales_sample.csv           # Sample dataset (20 records, 7 countries)
@@ -261,11 +261,11 @@ lakehouse-orchestrator/
 │       ├── ingestion.md               # Ingestion pipeline spec
 │       └── storage_layer.md           # Storage layer spec
 ├── postgres/
-│   └── init-superset-db.sql           # Creates Superset database on first boot
+│   └── init-superset-db.sh            # Creates Superset database on first boot (env-driven)
 ├── seaweedfs/
 │   └── s3-config.json                 # S3 gateway IAM and bucket configuration
 ├── superset/
-│   ├── Dockerfile                     # Custom Superset image (sqlalchemy-trino)
+│   ├── Dockerfile                     # Custom Superset image (sqlalchemy-trino, psycopg2-binary)
 │   ├── bootstrap.sh                   # Auto-provisioning entrypoint script
 │   └── superset_config.py             # Superset application configuration
 ├── trino/

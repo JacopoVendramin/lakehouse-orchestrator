@@ -13,6 +13,25 @@ queryable through Trino.
 
 ## Context
 
+### Pipeline Flow
+
+```mermaid
+flowchart LR
+    CSV["CSV File<br/>(./data/raw/)"]
+    Validate["1. Validate<br/>Schema"]
+    Upload["2. Upload<br/>to S3"]
+    Namespace["3. Create<br/>Namespace"]
+    Table["4. Create<br/>Table"]
+    Insert["5. Insert<br/>Data"]
+
+    CSV --> Validate --> Upload --> Namespace --> Table --> Insert
+
+    Upload -->|boto3| S3["SeaweedFS S3"]
+    Namespace -->|trino client| Trino["Trino"]
+    Table -->|trino client| Trino
+    Insert -->|trino client| Trino
+```
+
 The platform ingests structured sales data from CSV files placed in the
 `./data/raw/` directory. The initial dataset (`sales_sample.csv`) contains order
 records with the following columns:
@@ -102,6 +121,17 @@ Example: `s3://lakehouse/raw/sales/sales_sample.parquet`
 ---
 
 ## Idempotency Guarantees
+
+```mermaid
+flowchart TD
+    Trigger["DAG Triggered"] --> Validate["Validate CSV"]
+    Validate --> Upload["Upload to S3<br/>(overwrites existing)"]
+    Upload --> Schema["CREATE SCHEMA<br/>IF NOT EXISTS"]
+    Schema --> CreateTable["CREATE TABLE<br/>IF NOT EXISTS"]
+    CreateTable --> Delete["DELETE rows for<br/>ingestion_date"]
+    Delete --> Insert["INSERT new rows"]
+    Insert --> Done["Consistent state<br/>(no duplicates)"]
+```
 
 The pipeline is designed to be safely re-runnable:
 
