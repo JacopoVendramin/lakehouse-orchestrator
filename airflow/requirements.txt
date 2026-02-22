@@ -1,0 +1,20 @@
+# =============================================================================
+# Airflow Python Dependencies
+# =============================================================================
+# Pinned versions for reproducible builds.
+# Update versions deliberately and test before deploying.
+# =============================================================================
+
+# --- AWS / S3-compatible storage ---
+boto3==1.35.81
+
+# --- Trino query engine ---
+trino==0.330.0
+apache-airflow-providers-trino==5.8.0
+
+# --- Celery executor backend ---
+apache-airflow-providers-celery==3.8.5
+
+# --- Data processing ---
+pyarrow==18.1.0
+pandas==2.2.3
