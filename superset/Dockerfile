@@ -22,11 +22,12 @@ LABEL org.opencontainers.image.source="https://github.com/jvendramin/lakehouse-o
 # Switch to root to install Python packages, then drop back to superset.
 USER root
 
-RUN uv pip install --python /app/.venv/bin/python --no-cache sqlalchemy-trino psycopg2-binary
+RUN uv pip install --python /app/.venv/bin/python --no-cache sqlalchemy-trino psycopg2-binary requests
 
-# ---- Copy configuration and bootstrap script --------------------------------
+# ---- Copy configuration, bootstrap, and dashboard provisioner ----------------
 COPY superset_config.py /app/superset_config.py
 COPY bootstrap.sh /app/bootstrap.sh
+COPY provision_dashboard.py /app/provision_dashboard.py
 RUN chmod +x /app/bootstrap.sh
 
 # ---- Set Superset config path ------------------------------------------------

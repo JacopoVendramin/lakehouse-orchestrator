@@ -403,7 +403,7 @@ def csv_to_iceberg_pipeline() -> None:
             insert_sql = (
                 f"INSERT INTO {ICEBERG_FULL_TABLE} "
                 f"(order_id, customer_id, amount, country, ingestion_date) "
-                f"VALUES (?, ?, ?, ?, ?)"
+                f"VALUES (?, ?, ?, ?, CAST(? AS DATE))"
             )
 
             for row in df.itertuples(index=False):

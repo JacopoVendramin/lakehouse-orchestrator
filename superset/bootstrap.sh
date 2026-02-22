@@ -8,7 +8,8 @@
 #   3. Create the admin user (idempotent - skips if user exists)
 #   4. Initialise roles & permissions (superset init)
 #   5. Register the Trino datasource
-#   6. Start Gunicorn
+#   6. Provision dashboard with charts (background, non-blocking)
+#   7. Start Gunicorn
 #
 # Required environment variables (with defaults set in docker-compose):
 #   SUPERSET_DB_URI              - SQLAlchemy URI for the metadata DB
@@ -82,7 +83,13 @@ superset set-database-uri \
   || log "Trino datasource may already be registered - skipping."
 
 # ---------------------------------------------------------------------------
-# 5. Start Gunicorn
+# 5. Provision dashboard (background, non-blocking)
+# ---------------------------------------------------------------------------
+log "Launching dashboard provisioner in background ..."
+python3 /app/provision_dashboard.py &
+
+# ---------------------------------------------------------------------------
+# 6. Start Gunicorn
 # ---------------------------------------------------------------------------
 log "Starting Superset via Gunicorn on 0.0.0.0:8088 ..."
 exec gunicorn \

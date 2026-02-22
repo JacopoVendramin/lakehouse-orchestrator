@@ -56,13 +56,13 @@ catalog.
 
 | ID | Requirement |
 |----|-------------|
-| FR-1 | The DAG must read CSV files from `/opt/airflow/data/raw/` inside the worker container. |
+| FR-1 | The DAG must read the CSV file from `/opt/airflow/data/raw/sales_sample.csv` inside the worker container. |
 | FR-2 | The DAG must validate the CSV schema against an expected column set before processing. |
-| FR-3 | The DAG must convert validated CSV data to Parquet format using PyArrow. |
-| FR-4 | The DAG must upload the Parquet file to the `lakehouse` S3 bucket at the path `raw/sales/<filename>.parquet`. |
-| FR-5 | The DAG must create or update an Iceberg table in the `iceberg.lakehouse` schema via Trino DDL. |
+| FR-3 | The DAG must upload the validated CSV file to the `lakehouse` S3 bucket at the path `raw/sales/sales_sample.csv`. |
+| FR-4 | The DAG must create the Iceberg namespace (`iceberg.lakehouse`) and table (`sales`) via Trino DDL if they do not exist. |
+| FR-5 | The DAG must insert data into the Iceberg table using a delete-then-insert pattern keyed on `ingestion_date` for idempotency. |
 | FR-6 | The DAG must be idempotent: re-running the same DAG run for the same input file must not produce duplicate records or fail on conflict. |
-| FR-7 | The DAG must log each stage (validation, conversion, upload, registration) with sufficient detail for debugging. |
+| FR-7 | The DAG must log each stage (validation, upload, namespace creation, table creation, data insertion) with sufficient detail for debugging. |
 
 ### Non-Functional Requirements
 
@@ -93,20 +93,18 @@ Validation runs before any data transformation to fail fast on malformed input.
 ### Object Path Convention
 
 ```
-s3://lakehouse/raw/sales/<filename>.parquet
+s3://lakehouse/raw/sales/sales_sample.csv
 ```
-
-Example: `s3://lakehouse/raw/sales/sales_sample.parquet`
 
 ### Upload Behaviour
 
 - **Client**: `boto3.client('s3')` configured with the endpoint
   `http://seaweedfs-s3:8333`, access key, and secret key from environment
   variables.
-- **Overwrite semantics**: `put_object` overwrites any existing object at the
+- **Overwrite semantics**: `upload_file` overwrites any existing object at the
   same key. This supports idempotent re-runs without requiring a
   delete-then-upload pattern.
-- **Content type**: `application/octet-stream` (Parquet binary).
+- **Content type**: `text/csv`.
 - **Region**: `us-east-1` (SeaweedFS requires a region parameter but does not
   enforce geographic placement).
 
@@ -142,23 +140,57 @@ The pipeline is designed to be safely re-runnable:
 | **Duplicate DAG runs** | Airflow's execution date provides a natural idempotency key. Re-triggering the same logical run replays the same input. |
 | **Concurrent runs** | The Celery executor serialises tasks within a single DAG run. Separate DAG runs for different files are safe because they target different S3 keys. |
 
+### Delete-then-Insert Scope
+
+The idempotency strategy operates **per `ingestion_date`**, not per row or per
+full table. For each distinct `ingestion_date` found in the CSV, the pipeline:
+
+1. Deletes all existing rows in the Iceberg table for that date.
+2. Inserts all rows from the CSV for that date.
+
+This has important behavioural implications:
+
+| Scenario | Result |
+|----------|--------|
+| **Re-run with identical CSV** | No change. Same rows are deleted and re-inserted. |
+| **Remove some rows for a date that still has other rows** | Correct. All rows for that date are replaced with the CSV's current content. |
+| **Remove all rows for a specific date from the CSV** | **Stale data remains.** The date is no longer in the CSV, so no DELETE is issued. Old rows for that date persist in Iceberg. |
+| **Add rows with a new date** | Correct. DELETE finds nothing, INSERT adds the new rows. |
+
+> **Known limitation:** The pipeline does not perform a full-table reconciliation.
+> Dates that are removed entirely from the source CSV will retain their old data
+> in the Iceberg table. A future enhancement could add a `MERGE`-based approach
+> or a pre-insert step that deletes dates not present in the current CSV.
+
+---
+
+## Current Limitations
+
+| Limitation | Description | Impact |
+|-----------|-------------|--------|
+| **Single-file only** | The DAG reads a hardcoded path (`/opt/airflow/data/raw/sales_sample.csv`). Additional CSV files placed in `data/raw/` are ignored. | Cannot ingest multiple source files without code changes. |
+| **No orphan date cleanup** | Dates removed entirely from the CSV are not deleted from the Iceberg table (see Delete-then-Insert Scope above). | Stale data can accumulate if source dates are removed over time. |
+| **Row-by-row INSERT** | Data is inserted one row at a time via parameterized Trino queries. | Acceptable for the sample dataset (~200 rows) but would be a bottleneck at scale. A future version should use bulk `INSERT INTO ... SELECT` from a staged external table. |
+| **No Airflow Connections** | S3 and Trino connections are built directly from environment variables using `boto3` and `trino.dbapi`, bypassing Airflow's connection management. | Simplifies setup but sacrifices centralized credential management and the Connections UI. |
+| **No data quality checks** | Validation is limited to schema column matching. No checks for data ranges, nulls in business-critical fields, or referential integrity. | Bad data (e.g., negative amounts, future dates) passes through unchecked. |
+
 ---
 
 ## Acceptance Criteria
 
-- [ ] Running the DAG with `sales_sample.csv` produces a Parquet file at
-      `s3://lakehouse/raw/sales/sales_sample.parquet`.
-- [ ] The Parquet file is readable by Trino and matches the source CSV row count
-      and column types.
-- [ ] Running the same DAG a second time succeeds without errors and does not
+- [x] Running the DAG with `sales_sample.csv` uploads the CSV to
+      `s3://lakehouse/raw/sales/sales_sample.csv`.
+- [x] The Iceberg table `iceberg.lakehouse.sales` is queryable via Trino and
+      matches the source CSV row count and column types.
+- [x] Running the same DAG a second time succeeds without errors and does not
       produce duplicate records in the Iceberg table.
 - [ ] A CSV with a missing column causes the validation task to fail with a
       clear error message naming the missing column.
 - [ ] A CSV with an unexpected extra column causes the validation task to fail.
 - [ ] An empty CSV (header only) causes the validation task to fail.
-- [ ] S3 credentials are sourced from environment variables, not from DAG source
+- [x] S3 credentials are sourced from environment variables, not from DAG source
       code.
-- [ ] All task logs include timestamps and stage identifiers.
+- [x] All task logs include timestamps and stage identifiers.
 
 ---
 

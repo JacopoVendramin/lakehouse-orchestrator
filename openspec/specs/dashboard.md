@@ -226,37 +226,93 @@ by country over time.
 
 ## Dashboard Layout
 
-The recommended dashboard layout organises charts for an executive-level
-overview:
+The dashboard is **auto-provisioned** at container startup by
+`superset/provision_dashboard.py`, which runs in the background during the
+Superset bootstrap process. The provisioner uses the Superset REST API to create
+datasets, charts, and the dashboard layout programmatically.
+
+### Auto-Provisioning Architecture
 
 ```mermaid
-block-beta
-    columns 2
-    block:filters:2
-        F1["Filter: Date Range"]
-        F2["Filter: Country"]
+sequenceDiagram
+    participant BS as bootstrap.sh
+    participant Prov as provision_dashboard.py
+    participant API as Superset REST API
+    participant DB as PostgreSQL (Superset metadata)
+
+    BS->>Prov: Launch in background
+    BS->>BS: Start Gunicorn (foreground)
+    Prov->>API: Wait for /health (up to 60s)
+    Prov->>API: POST /security/login (get JWT)
+    Prov->>API: GET /security/csrf_token
+    Prov->>API: GET /database/ (find Trino Lakehouse)
+    Prov->>API: POST /dataset/ (create sales dataset)
+    loop For each chart definition
+        Prov->>API: POST /chart/ (create chart)
     end
-    block:topL
-        C1["Revenue by Country<br/>(bar chart)"]
-    end
-    block:topR
-        C2["Daily Revenue Trend<br/>(line chart)"]
-    end
-    block:botL
-        C3["Top 10 Customers<br/>(table)"]
-    end
-    block:botR
-        C4["Revenue by Country & Date<br/>(stacked area chart)"]
-    end
+    Prov->>API: POST /dashboard/ (create dashboard)
+    Prov->>API: PUT /dashboard/<id> (link charts via json_metadata)
+    API->>DB: Persist dashboard_slices associations
 ```
 
-### Filter Bar
+### Provisioned Charts
 
-- **Date Range**: filters all charts to a specific `ingestion_date` range.
-- **Country**: filters all charts to one or more selected countries.
+| Chart | Viz Type | Metric | Description |
+|-------|----------|--------|-------------|
+| Total Revenue | `big_number_total` | `SUM(amount)` | Single KPI showing total revenue across all data |
+| Total Orders | `big_number_total` | `COUNT(*)` | Single KPI showing total order count |
+| Average Order Value | `big_number_total` | `AVG(amount)` | Single KPI showing average revenue per order |
+| Revenue by Country | `echarts_timeseries_bar` | `SUM(amount)` by `country` | Bar chart ranking countries by total revenue |
+| Daily Revenue Trend | `echarts_timeseries_line` | `SUM(amount)` by `ingestion_date` | Line chart showing revenue over time |
+| Daily Orders Trend | `echarts_timeseries_line` | `COUNT(*)` by `ingestion_date` | Line chart showing order volume over time |
+| Orders by Country | `pie` | `COUNT(*)` by `country` | Pie chart showing order distribution across countries |
+| Top 10 Customers | `table` | `SUM(amount)`, `COUNT(*)` by `customer_id` | Table ranking customers by total spend |
 
-Filters are cross-linked: selecting a country in the bar chart applies the
-same filter to all other charts on the dashboard.
+### Dashboard Grid Layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Row 1: KPI Summary                                        │
+│  ┌─────────────┐  ┌─────────────┐  ┌───────────────────┐   │
+│  │   Total     │  │   Total     │  │  Average Order    │   │
+│  │   Revenue   │  │   Orders    │  │  Value            │   │
+│  └─────────────┘  └─────────────┘  └───────────────────┘   │
+├─────────────────────────────────────────────────────────────┤
+│  Row 2: Geographic & Distribution                          │
+│  ┌──────────────────────┐  ┌────────────────────────────┐  │
+│  │  Revenue by Country  │  │  Orders by Country (Pie)   │  │
+│  │  (Bar Chart)         │  │                            │  │
+│  └──────────────────────┘  └────────────────────────────┘  │
+├─────────────────────────────────────────────────────────────┤
+│  Row 3: Trends                                             │
+│  ┌──────────────────────┐  ┌────────────────────────────┐  │
+│  │  Daily Revenue Trend │  │  Daily Orders Trend        │  │
+│  │  (Line Chart)        │  │  (Line Chart)              │  │
+│  └──────────────────────┘  └────────────────────────────┘  │
+├─────────────────────────────────────────────────────────────┤
+│  Row 4: Customer Detail                                    │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Top 10 Customers (Table)                            │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Provisioner Idempotency
+
+The provisioner is idempotent:
+
+- If the dashboard already exists (matched by title), provisioning is skipped entirely.
+- If individual charts or datasets already exist (matched by name), they are reused rather than duplicated.
+- The provisioner runs as a non-fatal background process. If it fails, Superset still starts normally.
+
+### Provisioner Implementation Notes
+
+The Superset REST API's `POST /dashboard/` endpoint stores `position_json` but
+does **not** populate the `dashboard_slices` join table that links charts to the
+dashboard. To properly associate charts, the provisioner performs a follow-up
+`PUT /dashboard/<id>` with `json_metadata` containing a `positions` key. This
+triggers Superset's `set_dash_metadata()` method, which reads `chartId` from
+each CHART component's metadata and populates the `dashboard_slices` table.
 
 ---
 
@@ -283,15 +339,15 @@ ensuring the password stays in sync with `.env` and `docker-compose.yml`.
 
 ## Acceptance Criteria
 
-- [ ] Superset is accessible at `http://localhost:8088` after startup.
-- [ ] The admin user can log in with the configured credentials.
-- [ ] The "Trino Lakehouse" datasource is visible in the database list.
-- [ ] A dataset can be created from the `iceberg.lakehouse.sales` table.
-- [ ] The "Revenue by Country" query returns results grouped by country.
-- [ ] The "Top Customers" query returns the top 10 customers by revenue.
-- [ ] The "Daily Revenue Trends" query returns one row per ingestion date.
+- [x] Superset is accessible at `http://localhost:8088` after startup.
+- [x] The admin user can log in with the configured credentials.
+- [x] The "Trino Lakehouse" datasource is visible in the database list.
+- [x] A dataset is auto-created from the `iceberg.lakehouse.sales` table.
+- [x] The "Sales Lakehouse Dashboard" is auto-provisioned with 8 charts.
+- [x] Charts are properly linked to the dashboard (no orphan chart errors).
+- [x] The provisioner is idempotent: re-running does not create duplicates.
 - [ ] Dashboard filters apply cross-chart filtering by date range and country.
-- [ ] Superset metadata persists across container restarts (stored in
+- [x] Superset metadata persists across container restarts (stored in
       PostgreSQL).
 
 ---

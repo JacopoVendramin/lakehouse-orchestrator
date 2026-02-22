@@ -192,7 +192,26 @@ LIMIT 10;
 
 ## How to Connect Superset
 
-Superset is auto-configured on first startup. The bootstrap script registers a Trino database connection named **"Trino Lakehouse"** and starts the web server -- no manual setup required.
+Superset is auto-configured on first startup. The bootstrap script registers a Trino database connection named **"Trino Lakehouse"** and starts the web server. A background provisioner (`provision_dashboard.py`) automatically creates a **"Sales Lakehouse Dashboard"** with 8 charts -- no manual setup required.
+
+### Auto-Provisioned Dashboard
+
+After the DAG has been run at least once, the dashboard displays:
+
+| Chart | Type | Description |
+|-------|------|-------------|
+| Total Revenue | Big Number | Sum of all order amounts |
+| Total Orders | Big Number | Total order count |
+| Average Order Value | Big Number | Average revenue per order |
+| Revenue by Country | Bar Chart | Countries ranked by total revenue |
+| Orders by Country | Pie Chart | Order distribution across countries |
+| Daily Revenue Trend | Line Chart | Revenue over time |
+| Daily Orders Trend | Line Chart | Order volume over time |
+| Top 10 Customers | Table | Customers ranked by total spend |
+
+> **Note:** The dashboard is provisioned at Superset startup, but charts will
+> only display data after the Airflow DAG has been triggered and completed
+> successfully.
 
 ### Manual Configuration
 
@@ -250,7 +269,7 @@ lakehouse-orchestrator/
 │   └── requirements.txt               # Python dependencies (unpinned; managed by Airflow constraints)
 ├── data/
 │   └── raw/
-│       └── sales_sample.csv           # Sample dataset (20 records, 7 countries)
+│       └── sales_sample.csv           # Sample dataset (~200 records, 10 countries, 30 days)
 ├── openspec/
 │   ├── architecture.md                # Architecture specification
 │   ├── roadmap.md                     # Phased project roadmap
@@ -265,8 +284,9 @@ lakehouse-orchestrator/
 ├── seaweedfs/
 │   └── s3-config.json                 # S3 gateway IAM and bucket configuration
 ├── superset/
-│   ├── Dockerfile                     # Custom Superset image (sqlalchemy-trino, psycopg2-binary)
+│   ├── Dockerfile                     # Custom Superset image (sqlalchemy-trino, psycopg2-binary, requests)
 │   ├── bootstrap.sh                   # Auto-provisioning entrypoint script
+│   ├── provision_dashboard.py         # Dashboard auto-provisioner (REST API, 8 charts)
 │   └── superset_config.py             # Superset application configuration
 ├── trino/
 │   ├── catalog/
@@ -311,6 +331,29 @@ This project follows a spec-driven development methodology. Each major component
 | [`specs/iceberg_tables.md`](openspec/specs/iceberg_tables.md) | Iceberg table schema and partitioning design |
 | [`specs/celery_execution.md`](openspec/specs/celery_execution.md) | CeleryExecutor configuration and worker design |
 | [`specs/dashboard.md`](openspec/specs/dashboard.md) | Superset dashboard and visualization design |
+
+---
+
+## Known Limitations
+
+### Ingestion Pipeline
+
+| Limitation | Description |
+|-----------|-------------|
+| **Single-file ingestion** | The DAG reads only `data/raw/sales_sample.csv`. Additional CSV files in the directory are ignored. |
+| **No orphan date cleanup** | If all rows for a specific `ingestion_date` are removed from the CSV and the DAG is re-run, the old data for that date remains in the Iceberg table. The delete-then-insert strategy only processes dates *present* in the current CSV. |
+| **Row-by-row INSERT** | Data is inserted one row at a time via parameterized Trino queries. Acceptable for the sample dataset but would be a bottleneck at scale. |
+| **No Airflow Connections** | S3 and Trino connections are built directly from environment variables, bypassing Airflow's connection management UI. |
+
+### Re-run Behaviour
+
+| Scenario | Result |
+|----------|--------|
+| Re-run with identical CSV | Idempotent. Same rows are deleted and re-inserted. |
+| Remove some rows for a date (other rows for that date remain) | Correct. The date's rows are replaced with the CSV's current content. |
+| Remove all rows for a specific date | **Stale data remains.** The date is no longer in the CSV, so no DELETE is issued. |
+| Add rows with new dates | Correct. New dates are inserted, existing dates are refreshed. |
+| Add a new CSV file to `data/raw/` | **Ignored.** Only `sales_sample.csv` is processed. |
 
 ---
 
