@@ -1,9 +1,13 @@
 """
-CSV to Apache Iceberg ingestion pipeline.
+CSV to Apache Iceberg ingestion pipeline with incremental upsert.
 
 Reads a local CSV file, validates its schema, uploads it to S3-compatible
-object storage (SeaweedFS), then creates the target Iceberg namespace and
-table via Trino before inserting the data with full idempotency.
+object storage (SeaweedFS), then uses MERGE INTO for upsert semantics:
+new records are inserted, existing records (by ``order_id``) are updated.
+
+Supports watermark-based incremental extraction via Airflow Variables.
+Only rows with ``ingestion_date`` greater than the last watermark are
+processed, drastically reducing Trino work on re-runs.
 
 Designed for CeleryExecutor: every task is a standalone PythonOperator that
 serialises cleanly across Celery workers.
@@ -15,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +27,7 @@ import boto3
 import pandas as pd
 import trino
 from airflow.decorators import dag, task
+from airflow.models import Variable
 
 # =============================================================================
 # Constants
@@ -49,6 +54,12 @@ ICEBERG_FULL_TABLE: str = f"{ICEBERG_CATALOG}.{ICEBERG_SCHEMA}.{ICEBERG_TABLE}"
 SCHEMA_LOCATION: str = "s3a://lakehouse-warehouse/lakehouse/"
 TRINO_USER: str = "airflow"
 
+# -- Watermark ---------------------------------------------------------------
+WATERMARK_VAR_KEY: str = "sales_pipeline_watermark"
+
+# -- Batch size for MERGE INTO -----------------------------------------------
+MERGE_BATCH_SIZE: int = 50
+
 log = logging.getLogger(__name__)
 
 # =============================================================================
@@ -56,14 +67,15 @@ log = logging.getLogger(__name__)
 # =============================================================================
 
 DAG_DOC_MD: str = """
-### CSV to Iceberg Pipeline
+### CSV to Iceberg Pipeline (Incremental Upsert)
 
-| Property       | Value                                |
-|----------------|--------------------------------------|
-| **Schedule**   | `@daily`                             |
-| **Owner**      | `data-engineering`                   |
-| **Executor**   | `CeleryExecutor`                     |
-| **Idempotent** | Yes (delete + re-insert per date)    |
+| Property       | Value                                         |
+|----------------|-----------------------------------------------|
+| **Schedule**   | `@daily`                                      |
+| **Owner**      | `data-engineering`                            |
+| **Executor**   | `CeleryExecutor`                              |
+| **Idempotent** | Yes (MERGE INTO by `order_id`)                |
+| **Incremental**| Yes (watermark on `ingestion_date`)           |
 
 #### Task Graph
 
@@ -76,24 +88,27 @@ create_iceberg_namespace
         |
  create_iceberg_table
         |
-insert_data_into_iceberg
+ upsert_data_into_iceberg
+        |
+ update_watermark
 ```
 
 #### Description
 
-End-to-end batch ingestion pipeline that moves a local CSV file through
-the lakehouse stack:
+End-to-end batch ingestion pipeline with incremental upsert:
 
 1. **Schema validation** -- confirms the CSV matches the expected column
    contract before any downstream work begins.
 2. **S3 upload** -- persists the raw file to SeaweedFS for durability and
    lineage.  Overwrites on re-run (idempotent).
 3. **Namespace creation** -- ensures the Iceberg schema exists in Trino.
-4. **Table creation** -- creates the partitioned Iceberg table if it does
-   not already exist.
-5. **Data insertion** -- loads rows into the Iceberg table using a
-   *delete-then-insert* pattern keyed on `ingestion_date` so that
-   re-runs never produce duplicates.
+4. **Table creation** -- creates the partitioned Iceberg table with audit
+   columns if it does not already exist.
+5. **Upsert** -- uses MERGE INTO with `order_id` as the merge key.
+   Only rows newer than the stored watermark are processed.
+   Existing rows are updated, new rows are inserted.
+6. **Watermark update** -- persists the highest `ingestion_date` processed
+   to an Airflow Variable for the next run.
 
 #### Environment Variables
 
@@ -115,15 +130,7 @@ the lakehouse stack:
 
 
 def _get_s3_client() -> boto3.client:
-    """Build a boto3 S3 client from environment variables.
-
-    Returns:
-        A configured ``boto3.client('s3')`` pointed at the SeaweedFS
-        gateway (or any S3-compatible endpoint).
-
-    Raises:
-        KeyError: If a required environment variable is missing.
-    """
+    """Build a boto3 S3 client from environment variables."""
     return boto3.client(
         "s3",
         endpoint_url=os.environ["S3_ENDPOINT_URL"],
@@ -134,14 +141,7 @@ def _get_s3_client() -> boto3.client:
 
 
 def _get_trino_connection() -> trino.dbapi.Connection:
-    """Open a DBAPI connection to the Trino coordinator.
-
-    Returns:
-        A ``trino.dbapi.Connection`` ready for cursor operations.
-
-    Raises:
-        KeyError: If ``TRINO_HOST`` or ``TRINO_PORT`` is not set.
-    """
+    """Open a DBAPI connection to the Trino coordinator."""
     return trino.dbapi.connect(
         host=os.environ["TRINO_HOST"],
         port=int(os.environ["TRINO_PORT"]),
@@ -152,18 +152,7 @@ def _get_trino_connection() -> trino.dbapi.Connection:
 
 
 def _read_csv(path: str) -> pd.DataFrame:
-    """Read a CSV file into a DataFrame with basic sanity checks.
-
-    Args:
-        path: Absolute filesystem path to the CSV file.
-
-    Returns:
-        A ``pandas.DataFrame`` with the file contents.
-
-    Raises:
-        FileNotFoundError: If *path* does not exist.
-        ValueError: If the file is empty.
-    """
+    """Read a CSV file into a DataFrame with basic sanity checks."""
     if not Path(path).is_file():
         raise FileNotFoundError(f"CSV file not found: {path}")
 
@@ -175,6 +164,25 @@ def _read_csv(path: str) -> pd.DataFrame:
     return df
 
 
+def _get_watermark() -> str | None:
+    """Retrieve the last watermark from Airflow Variables.
+
+    Returns:
+        The watermark date string (``YYYY-MM-DD``) or ``None`` if no
+        watermark has been set yet (first run).
+    """
+    try:
+        return Variable.get(WATERMARK_VAR_KEY, default_var=None)
+    except Exception:
+        return None
+
+
+def _set_watermark(date_str: str) -> None:
+    """Persist a new watermark to Airflow Variables."""
+    Variable.set(WATERMARK_VAR_KEY, date_str)
+    log.info("Watermark updated to %s", date_str)
+
+
 # =============================================================================
 # DAG definition
 # =============================================================================
@@ -182,12 +190,15 @@ def _read_csv(path: str) -> pd.DataFrame:
 
 @dag(
     dag_id="csv_to_iceberg_pipeline",
-    description="Ingest a CSV file into an Apache Iceberg table via Trino",
+    description=(
+        "Ingest a CSV file into an Apache Iceberg table via Trino "
+        "with MERGE INTO upsert and watermark-based incremental extraction"
+    ),
     doc_md=DAG_DOC_MD,
     schedule="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["lakehouse", "iceberg", "ingestion"],
+    tags=["lakehouse", "iceberg", "ingestion", "incremental"],
     default_args={
         "owner": "data-engineering",
         "retries": 2,
@@ -205,16 +216,8 @@ def csv_to_iceberg_pipeline() -> None:
     def validate_csv_schema() -> dict[str, Any]:
         """Read the source CSV and verify its columns match the expected schema.
 
-        Ensures the file exists, is not empty, and contains exactly the
-        columns defined in ``EXPECTED_COLUMNS`` (order-sensitive).
-
         Returns:
-            A summary dict with ``row_count`` and ``columns`` for
-            downstream XCom consumers.
-
-        Raises:
-            FileNotFoundError: If the CSV file is missing.
-            ValueError: If the file is empty or the schema does not match.
+            A summary dict with ``row_count`` and ``columns``.
         """
         log.info("Reading CSV from %s", CSV_FILE_PATH)
         df = _read_csv(CSV_FILE_PATH)
@@ -241,19 +244,7 @@ def csv_to_iceberg_pipeline() -> None:
 
     @task()
     def upload_csv_to_s3() -> dict[str, str]:
-        """Upload the CSV file to S3-compatible storage (SeaweedFS).
-
-        The upload is idempotent: if the object already exists it will be
-        silently overwritten.
-
-        Returns:
-            A dict with ``bucket`` and ``key`` confirming the upload
-            location.
-
-        Raises:
-            FileNotFoundError: If the local CSV file is missing.
-            botocore.exceptions.ClientError: On S3 communication failures.
-        """
+        """Upload the CSV file to S3-compatible storage (SeaweedFS)."""
         bucket = os.environ["S3_BUCKET_NAME"]
 
         log.info(
@@ -275,17 +266,7 @@ def csv_to_iceberg_pipeline() -> None:
 
     @task()
     def create_iceberg_namespace() -> None:
-        """Create the Iceberg schema (namespace) in Trino if it does not exist.
-
-        Executes:
-            ``CREATE SCHEMA IF NOT EXISTS iceberg.lakehouse``
-
-        The schema is backed by the S3 location defined in
-        ``SCHEMA_LOCATION``.
-
-        Raises:
-            trino.exceptions.TrinoExternalError: On Trino query failures.
-        """
+        """Create the Iceberg schema (namespace) in Trino if it does not exist."""
         ddl = (
             f"CREATE SCHEMA IF NOT EXISTS {ICEBERG_CATALOG}.{ICEBERG_SCHEMA} "
             f"WITH (location = '{SCHEMA_LOCATION}')"
@@ -303,27 +284,21 @@ def csv_to_iceberg_pipeline() -> None:
             conn.close()
 
     # --------------------------------------------------------------------- #
-    # Task 4 -- Create Iceberg table
+    # Task 4 -- Create Iceberg table (with audit columns)
     # --------------------------------------------------------------------- #
 
     @task()
     def create_iceberg_table() -> None:
-        """Create the partitioned Iceberg table in Trino if it does not exist.
-
-        The table is partitioned by ``ingestion_date`` and stored in
-        Parquet format to balance query performance with storage
-        efficiency.
-
-        Raises:
-            trino.exceptions.TrinoExternalError: On Trino query failures.
-        """
+        """Create the partitioned Iceberg table with audit columns."""
         ddl = f"""
             CREATE TABLE IF NOT EXISTS {ICEBERG_FULL_TABLE} (
-                order_id    VARCHAR,
-                customer_id VARCHAR,
-                amount      DOUBLE,
-                country     VARCHAR,
-                ingestion_date DATE
+                order_id       VARCHAR,
+                customer_id    VARCHAR,
+                amount         DOUBLE,
+                country        VARCHAR,
+                ingestion_date DATE,
+                _source_file   VARCHAR,
+                _ingested_at   TIMESTAMP(6)
             )
             WITH (
                 format       = 'PARQUET',
@@ -343,106 +318,200 @@ def csv_to_iceberg_pipeline() -> None:
             conn.close()
 
     # --------------------------------------------------------------------- #
-    # Task 5 -- Insert data into Iceberg
+    # Task 5 -- Upsert data via MERGE INTO
     # --------------------------------------------------------------------- #
 
     @task()
-    def insert_data_into_iceberg() -> dict[str, Any]:
-        """Load CSV rows into the Iceberg table with idempotent semantics.
+    def upsert_data_into_iceberg() -> dict[str, Any]:
+        """Load CSV rows into the Iceberg table using MERGE INTO.
 
-        Idempotency strategy (per ``ingestion_date``):
-            1. Identify every distinct ``ingestion_date`` present in the
-               source CSV.
-            2. ``DELETE`` existing rows for those dates from the target
-               table.
-            3. ``INSERT`` all rows from the CSV.
+        Incremental strategy:
+            1. Read the watermark from Airflow Variables.
+            2. Filter the CSV to only rows with ``ingestion_date`` >
+               watermark (or all rows on first run).
+            3. For each batch, execute a MERGE INTO statement that:
+               - Updates existing rows (matched by ``order_id``)
+               - Inserts new rows (not matched)
 
-        This delete-then-insert pattern guarantees that re-running the
-        task for the same file produces the same result without
-        duplicating data.
+        This approach guarantees:
+            - No duplicate records (dedup by ``order_id``)
+            - Changed records are updated in-place
+            - ``_ingested_at`` reflects the most recent ingestion time
+            - Re-runs are safe (MERGE INTO is idempotent)
 
         Returns:
-            A dict with ``rows_inserted`` and ``dates_processed`` for
-            observability.
-
-        Raises:
-            trino.exceptions.TrinoExternalError: On Trino query failures.
-            ValueError: If the CSV is empty.
+            A dict with processing stats.
         """
         df = _read_csv(CSV_FILE_PATH)
 
         # Coerce ingestion_date to proper date strings for Trino
         df["ingestion_date"] = pd.to_datetime(df["ingestion_date"]).dt.date
 
-        distinct_dates: list[str] = sorted(
-            df["ingestion_date"].unique().astype(str).tolist()
-        )
+        # --- Watermark filtering ---
+        watermark = _get_watermark()
+        total_rows = len(df)
+
+        if watermark:
+            watermark_date = datetime.strptime(watermark, "%Y-%m-%d").date()
+            df = df[df["ingestion_date"] > watermark_date]
+            log.info(
+                "Watermark filter: %s → %d/%d rows selected (after %s)",
+                WATERMARK_VAR_KEY,
+                len(df),
+                total_rows,
+                watermark,
+            )
+        else:
+            log.info(
+                "No watermark found — processing all %d rows (first run).",
+                total_rows,
+            )
+
+        if df.empty:
+            log.info("No new rows to process after watermark filtering.")
+            return {
+                "rows_merged": 0,
+                "watermark_before": watermark,
+                "watermark_after": watermark,
+                "skipped": True,
+            }
+
+        # Track the max date for watermark update
+        max_date = str(df["ingestion_date"].max())
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+        source_file = S3_UPLOAD_KEY
 
         log.info(
-            "Preparing to insert %d rows for %d distinct ingestion date(s): %s",
+            "Preparing MERGE INTO for %d rows (dates: %s to %s)",
             len(df),
-            len(distinct_dates),
-            distinct_dates,
+            df["ingestion_date"].min(),
+            max_date,
         )
 
         conn = _get_trino_connection()
+        rows_merged = 0
         try:
             cursor = conn.cursor()
 
-            # -- Step 1: Delete existing data for affected dates ---------- #
-            for date_str in distinct_dates:
-                delete_sql = (
-                    f"DELETE FROM {ICEBERG_FULL_TABLE} "
-                    f"WHERE ingestion_date = DATE '{date_str}'"
-                )
-                log.info("Deleting existing rows: %s", delete_sql)
-                cursor.execute(delete_sql)
-                cursor.fetchone()
+            # Process in batches to avoid oversized queries
+            records = df.to_dict("records")
+            for batch_start in range(0, len(records), MERGE_BATCH_SIZE):
+                batch = records[batch_start : batch_start + MERGE_BATCH_SIZE]
 
-            # -- Step 2: Insert fresh rows -------------------------------- #
-            insert_sql = (
-                f"INSERT INTO {ICEBERG_FULL_TABLE} "
-                f"(order_id, customer_id, amount, country, ingestion_date) "
-                f"VALUES (?, ?, ?, ?, CAST(? AS DATE))"
-            )
+                # Build VALUES clause for the source CTE
+                value_rows: list[str] = []
+                for rec in batch:
+                    # Escape single quotes in string values
+                    order_id = str(rec["order_id"]).replace("'", "''")
+                    customer_id = str(rec["customer_id"]).replace("'", "''")
+                    country = str(rec["country"]).replace("'", "''")
+                    amount = float(rec["amount"])
+                    ing_date = str(rec["ingestion_date"])
 
-            for row in df.itertuples(index=False):
-                cursor.execute(
-                    insert_sql,
-                    (
-                        str(row.order_id),
-                        str(row.customer_id),
-                        float(row.amount),
-                        str(row.country),
-                        str(row.ingestion_date),
-                    ),
-                )
+                    value_rows.append(
+                        f"('{order_id}', '{customer_id}', {amount}, "
+                        f"'{country}', DATE '{ing_date}', "
+                        f"'{source_file}', TIMESTAMP '{now_str}')"
+                    )
+
+                values_clause = ",\n        ".join(value_rows)
+
+                merge_sql = f"""
+                    MERGE INTO {ICEBERG_FULL_TABLE} AS target
+                    USING (
+                        VALUES
+                        {values_clause}
+                    ) AS source (
+                        order_id, customer_id, amount, country,
+                        ingestion_date, _source_file, _ingested_at
+                    )
+                    ON target.order_id = source.order_id
+                    WHEN MATCHED THEN UPDATE SET
+                        customer_id    = source.customer_id,
+                        amount         = source.amount,
+                        country        = source.country,
+                        ingestion_date = source.ingestion_date,
+                        _source_file   = source._source_file,
+                        _ingested_at   = source._ingested_at
+                    WHEN NOT MATCHED THEN INSERT (
+                        order_id, customer_id, amount, country,
+                        ingestion_date, _source_file, _ingested_at
+                    ) VALUES (
+                        source.order_id, source.customer_id, source.amount,
+                        source.country, source.ingestion_date,
+                        source._source_file, source._ingested_at
+                    )
+                """
+
+                cursor.execute(merge_sql)
                 cursor.fetchone()
+                rows_merged += len(batch)
+
+                log.info(
+                    "MERGE batch %d: %d rows processed (%d/%d total)",
+                    batch_start // MERGE_BATCH_SIZE + 1,
+                    len(batch),
+                    rows_merged,
+                    len(records),
+                )
 
             log.info(
-                "Successfully inserted %d rows across dates %s",
-                len(df),
-                distinct_dates,
+                "MERGE INTO complete: %d rows processed",
+                rows_merged,
             )
         finally:
             conn.close()
 
         return {
-            "rows_inserted": len(df),
-            "dates_processed": distinct_dates,
+            "rows_merged": rows_merged,
+            "watermark_before": watermark,
+            "watermark_after": max_date,
+            "source_file": source_file,
         }
+
+    # --------------------------------------------------------------------- #
+    # Task 6 -- Update watermark
+    # --------------------------------------------------------------------- #
+
+    @task()
+    def update_watermark(upsert_result: dict[str, Any]) -> None:
+        """Persist the new watermark after a successful upsert.
+
+        Only updates the watermark if the upsert actually processed
+        rows and the new watermark is higher than the current one.
+        """
+        if upsert_result.get("skipped"):
+            log.info("Upsert was skipped — watermark unchanged.")
+            return
+
+        new_watermark = upsert_result.get("watermark_after")
+        if not new_watermark:
+            log.warning("No watermark_after in upsert result — skipping.")
+            return
+
+        current = _get_watermark()
+        if current and current >= new_watermark:
+            log.info(
+                "Current watermark %s >= new %s — not updating.",
+                current,
+                new_watermark,
+            )
+            return
+
+        _set_watermark(new_watermark)
 
     # --------------------------------------------------------------------- #
     # Task dependencies
     # --------------------------------------------------------------------- #
 
-    (
-        validate_csv_schema()
-        >> upload_csv_to_s3()
-        >> create_iceberg_namespace()
-        >> create_iceberg_table()
-        >> insert_data_into_iceberg()
-    )
+    t1 = validate_csv_schema()
+    t2 = upload_csv_to_s3()
+    t3 = create_iceberg_namespace()
+    t4 = create_iceberg_table()
+    t5 = upsert_data_into_iceberg()
+    t6 = update_watermark(t5)
+
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6
 
 
 # Instantiate the DAG

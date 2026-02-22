@@ -1,0 +1,11 @@
+id,name,email,age,salary,signup_date,is_active
+1,Mario Rossi,mario@example.com,35,52000.50,2024-01-15,true
+2,Anna Bianchi,anna@example.com,28,45000.00,2024-02-20,true
+3,Luca Verdi,luca@example.com,42,67500.75,2024-03-10,false
+4,Elena Neri,elena@example.com,31,48000.00,2024-04-05,true
+5,Marco Russo,marco@example.com,55,82000.25,2024-05-12,true
+6,Sara Colombo,sara@example.com,26,38000.00,2024-06-01,false
+7,Davide Ferrari,davide@example.com,39,61000.50,2024-07-18,true
+8,Giulia Romano,giulia@example.com,33,53500.00,2024-08-22,true
+9,Paolo Galli,paolo@example.com,47,71000.00,2024-09-30,true
+10,Chiara Conti,chiara@example.com,29,42000.75,2024-10-15,false

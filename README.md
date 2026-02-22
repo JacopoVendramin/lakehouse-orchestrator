@@ -94,7 +94,7 @@ cp .env.example .env
 docker compose up -d
 ```
 
-Initial startup takes approximately 2-3 minutes. Airflow runs database migrations and creates the admin user on first boot. SeaweedFS buckets (`lakehouse`, `lakehouse-warehouse`) are provisioned automatically by the `s3-init` container.
+Initial startup takes approximately 2-3 minutes. Airflow runs database migrations and creates the admin user on first boot. SeaweedFS buckets (`lakehouse`, `lakehouse-warehouse`, `csv-uploads`) are provisioned automatically by the `s3-init` container.
 
 Verify all services are healthy:
 
@@ -119,12 +119,16 @@ Once all services report `healthy` or `running`, open the interfaces listed in t
 | SeaweedFS Filer | [http://localhost:8888](http://localhost:8888) | 8888 | -- |
 | Iceberg REST Catalog | [http://localhost:8181](http://localhost:8181) | 8181 | -- |
 | PostgreSQL | `localhost:5432` | 5432 | `airflow` / `airflow` |
+| Prometheus | [http://localhost:9090](http://localhost:9090) | 9090 | -- |
+| Grafana | [http://localhost:3000](http://localhost:3000) | 3000 | `admin` / `admin` |
 
 All ports are configurable via environment variables in `.env`.
 
 ---
 
 ## How to Trigger the DAG
+
+### Sales Pipeline (Manual)
 
 The `csv_to_iceberg_pipeline` DAG is paused by default. Unpause and trigger it from the Airflow UI or the CLI:
 
@@ -136,15 +140,145 @@ docker compose exec airflow-webserver airflow dags unpause csv_to_iceberg_pipeli
 docker compose exec airflow-webserver airflow dags trigger csv_to_iceberg_pipeline
 ```
 
-The pipeline executes five sequential tasks:
+The pipeline executes six sequential tasks using incremental upsert semantics:
 
 1. **validate_csv_schema** -- confirms the CSV matches the expected column contract
 2. **upload_csv_to_s3** -- uploads the raw file to SeaweedFS for durability
 3. **create_iceberg_namespace** -- creates the `iceberg.lakehouse` schema in Trino
-4. **create_iceberg_table** -- creates the partitioned Iceberg table (Parquet format, partitioned by `ingestion_date`)
-5. **insert_data_into_iceberg** -- loads rows using a delete-then-insert pattern for idempotency
+4. **create_iceberg_table** -- creates the partitioned Iceberg table (Parquet format, partitioned by `ingestion_date`) with audit columns (`_source_file`, `_ingested_at`)
+5. **upsert_data_into_iceberg** -- uses MERGE INTO with `order_id` as the merge key for upsert semantics; only rows newer than the current watermark are extracted from the CSV (watermark-based incremental extraction via Airflow Variables)
+6. **update_watermark** -- advances the Airflow Variable watermark to the highest `ingestion_date` processed in this run
 
 Monitor progress in the Airflow UI at [http://localhost:8081](http://localhost:8081) or watch Celery worker activity in Flower at [http://localhost:5555](http://localhost:5555).
+
+### CSV Auto-Ingest Pipeline (Automatic)
+
+The `csv_auto_ingest` DAG polls the `s3://csv-uploads` bucket every 5 minutes for new CSV files and automatically creates Iceberg tables from them. No schema definition or DAG modification is needed.
+
+**Usage:**
+
+1. Unpause the DAG:
+
+   ```bash
+   docker compose exec airflow-webserver airflow dags unpause csv_auto_ingest
+   ```
+
+2. Upload a CSV to the ingest bucket. The directory name becomes the table name:
+
+   ```bash
+   # Upload via aws CLI
+   aws --endpoint-url http://localhost:8333 s3 cp my_data.csv s3://csv-uploads/my_table/my_data.csv
+
+   # Or via curl (SeaweedFS S3 gateway)
+   curl -X PUT "http://localhost:8333/csv-uploads/my_table/my_data.csv" \
+     --data-binary @my_data.csv
+   ```
+
+3. Wait for the next polling cycle (up to 5 minutes) or trigger manually:
+
+   ```bash
+   docker compose exec airflow-webserver airflow dags trigger csv_auto_ingest
+   ```
+
+4. Query the new table in Trino:
+
+   ```sql
+   SELECT * FROM iceberg.lakehouse.my_table;
+   ```
+
+**Features:**
+
+| Feature | Details |
+|---------|---------|
+| Schema inference | Detects INTEGER, BIGINT, DOUBLE, BOOLEAN, DATE, TIMESTAMP, VARCHAR |
+| Delimiter detection | Auto-detects comma, semicolon, tab, pipe via `csv.Sniffer` |
+| Schema evolution | New columns in re-uploaded CSVs are added via `ALTER TABLE ADD COLUMN` |
+| Idempotent | ETag-based tracking prevents re-processing unchanged files |
+| Replace strategy | Re-uploading a file replaces only its rows (keyed on `_source_file`) |
+| Audit columns | `_source_file` and `_ingested_at` added to every row |
+| Superset auto-registration | New tables are automatically registered as Superset datasets |
+| Parallel processing | Multiple files processed concurrently via CeleryExecutor |
+
+### Data Quality Checks (Automatic Gate)
+
+The `data_quality_checks` DAG runs automated validations against the `sales` table after ingestion. Failed checks halt downstream processing and generate visible failures in the Airflow UI.
+
+**Usage:**
+
+1. Unpause the DAG:
+   ```bash
+   docker compose exec airflow-webserver airflow dags unpause data_quality_checks
+   ```
+
+2. The DAG runs daily on schedule or can be triggered manually:
+   ```bash
+   docker compose exec airflow-webserver airflow dags trigger data_quality_checks
+   ```
+
+3. Query check results in Trino:
+   ```sql
+   SELECT * FROM iceberg.lakehouse._quality_results ORDER BY executed_at DESC;
+   ```
+
+**Features:**
+
+| Feature | Details |
+|---------|---------|
+| Check types | uniqueness, not_null, accepted_values, positive, range, row_count_range, no_future_dates, custom_sql |
+| Sales checks | 8 automated checks (order_id uniqueness, amount positive, country validation, etc.) |
+| Gate task | Raises AirflowFailException on any failed check |
+| Results persistence | All results stored in `_quality_results` Iceberg table |
+| Queryable history | Results queryable via Trino and visualizable in Superset |
+| Extensible | Add checks for any table via declarative QualityCheck definitions |
+
+### Monitoring & Observability
+
+Prometheus scrapes metrics from all platform services through dedicated exporters:
+
+| Exporter | Metrics Source |
+|----------|---------------|
+| StatsD Exporter | Airflow CeleryExecutor (DAG runs, task duration, scheduler heartbeat) |
+| PostgreSQL Exporter | Connection count, cache hit ratio, query latency |
+| Valkey Exporter | Memory usage, connected clients, command throughput |
+| SeaweedFS (native) | Volume server health, storage capacity, S3 request rates |
+
+Grafana is auto-provisioned on first boot with a **"Lakehouse Platform Overview"** dashboard containing 10 panels. No manual configuration is required -- the datasource, dashboard JSON, and alerting rules are all provisioned via Grafana's provisioning API.
+
+**5 alerting rules** are pre-configured:
+
+1. Airflow task failure rate exceeds threshold
+2. PostgreSQL connection count exceeds 80% of max
+3. PostgreSQL cache hit ratio drops below 95%
+4. Valkey memory usage exceeds 80%
+5. SeaweedFS volume server down
+
+Access Grafana at [http://localhost:3000](http://localhost:3000) (default credentials: `admin` / `admin`).
+
+### Iceberg Table Maintenance
+
+The `iceberg_maintenance` DAG automates Iceberg table maintenance to prevent storage bloat and maintain query performance. It runs daily at 3 AM UTC and dynamically discovers all tables in the `iceberg.lakehouse` schema.
+
+**Operations per table:**
+
+| Operation | Description |
+|-----------|-------------|
+| `optimize` | Compacts small Parquet files into larger files for better scan performance |
+| `expire_snapshots` | Removes snapshots older than 7 days to free storage |
+| `remove_orphan_files` | Deletes data files not referenced by any current snapshot |
+
+Dynamic task mapping ensures newly created tables are automatically maintained without any DAG changes. All results are tracked in the `_maintenance_log` Iceberg table.
+
+**Usage:**
+
+```bash
+docker compose exec airflow-webserver airflow dags unpause iceberg_maintenance
+```
+
+**Query maintenance history:**
+
+```sql
+SELECT * FROM iceberg.lakehouse._maintenance_log ORDER BY executed_at DESC;
+```
 
 ---
 
@@ -263,21 +397,46 @@ LIMIT 5;
 lakehouse-orchestrator/
 ├── airflow/
 │   ├── dags/
-│   │   └── csv_to_iceberg_celery.py   # Ingestion DAG: CSV → S3 → Iceberg
+│   │   ├── csv_to_iceberg_celery.py   # Ingestion DAG: CSV → S3 → Iceberg
+│   │   ├── csv_auto_ingest.py         # Auto-ingest DAG: S3 polling → schema inference → Iceberg
+│   │   ├── data_quality_checks.py     # Quality gate DAG: validations → persist + gate
+│   │   ├── iceberg_maintenance.py     # Maintenance DAG: compaction, snapshot expiry, orphan cleanup
+│   │   └── lib/
+│   │       ├── __init__.py
+│   │       ├── type_inference.py      # Column type detection engine
+│   │       ├── schema_manager.py      # DDL generation and schema evolution
+│   │       ├── superset_client.py     # Superset dataset auto-registration
+│   │       ├── quality_checks.py      # Data quality validation framework
+│   │       └── iceberg_maintenance.py # Iceberg maintenance operations library
 │   ├── plugins/                        # Custom Airflow plugins (extensible)
 │   ├── Dockerfile                      # Custom Airflow image (boto3, trino, celery)
 │   └── requirements.txt               # Python dependencies (unpinned; managed by Airflow constraints)
 ├── data/
 │   └── raw/
 │       └── sales_sample.csv           # Sample dataset (~200 records, 10 countries, 30 days)
+├── monitoring/
+│   ├── prometheus/
+│   │   ├── prometheus.yml             # Prometheus scrape configuration for all services
+│   │   └── alert_rules.yml            # Alerting rules (5 rules)
+│   └── grafana/
+│       ├── provisioning/              # Datasource and dashboard provisioning config
+│       │   ├── datasources/
+│       │   │   └── prometheus.yml     # Prometheus datasource auto-provisioning
+│       │   └── dashboards/
+│       │       └── dashboards.yml     # Dashboard provider configuration
+│       └── dashboards/
+│           └── lakehouse-overview.json # Lakehouse Platform Overview dashboard (10 panels)
 ├── openspec/
 │   ├── architecture.md                # Architecture specification
 │   ├── roadmap.md                     # Phased project roadmap
 │   └── specs/
 │       ├── celery_execution.md        # CeleryExecutor design spec
 │       ├── dashboard.md               # Superset dashboard spec
+│       ├── data-quality.md            # Data quality checks spec
 │       ├── iceberg_tables.md          # Iceberg table design spec
+│       ├── iceberg-maintenance.md     # Iceberg maintenance spec
 │       ├── ingestion.md               # Ingestion pipeline spec
+│       ├── monitoring.md              # Monitoring and observability spec
 │       └── storage_layer.md           # Storage layer spec
 ├── postgres/
 │   └── init-superset-db.sh            # Creates Superset database on first boot (env-driven)
@@ -331,6 +490,10 @@ This project follows a spec-driven development methodology. Each major component
 | [`specs/iceberg_tables.md`](openspec/specs/iceberg_tables.md) | Iceberg table schema and partitioning design |
 | [`specs/celery_execution.md`](openspec/specs/celery_execution.md) | CeleryExecutor configuration and worker design |
 | [`specs/dashboard.md`](openspec/specs/dashboard.md) | Superset dashboard and visualization design |
+| [`specs/csv-auto-ingest.md`](openspec/specs/csv-auto-ingest.md) | CSV auto-ingest pipeline specification |
+| [`specs/data-quality.md`](openspec/specs/data-quality.md) | Data quality checks specification |
+| [`specs/monitoring.md`](openspec/specs/monitoring.md) | Monitoring and observability specification |
+| [`specs/iceberg-maintenance.md`](openspec/specs/iceberg-maintenance.md) | Iceberg table maintenance specification |
 
 ---
 
@@ -340,30 +503,30 @@ This project follows a spec-driven development methodology. Each major component
 
 | Limitation | Description |
 |-----------|-------------|
-| **Single-file ingestion** | The DAG reads only `data/raw/sales_sample.csv`. Additional CSV files in the directory are ignored. |
+| **Single-file ingestion (sales pipeline)** | The sales pipeline DAG reads only `data/raw/sales_sample.csv`. Additional CSV files in the directory are ignored. The auto-ingest pipeline handles arbitrary files via S3 upload. |
 | **No orphan date cleanup** | If all rows for a specific `ingestion_date` are removed from the CSV and the DAG is re-run, the old data for that date remains in the Iceberg table. The delete-then-insert strategy only processes dates *present* in the current CSV. |
-| **Row-by-row INSERT** | Data is inserted one row at a time via parameterized Trino queries. Acceptable for the sample dataset but would be a bottleneck at scale. |
 | **No Airflow Connections** | S3 and Trino connections are built directly from environment variables, bypassing Airflow's connection management UI. |
 
 ### Re-run Behaviour
 
 | Scenario | Result |
 |----------|--------|
-| Re-run with identical CSV | Idempotent. Same rows are deleted and re-inserted. |
-| Remove some rows for a date (other rows for that date remain) | Correct. The date's rows are replaced with the CSV's current content. |
-| Remove all rows for a specific date | **Stale data remains.** The date is no longer in the CSV, so no DELETE is issued. |
-| Add rows with new dates | Correct. New dates are inserted, existing dates are refreshed. |
-| Add a new CSV file to `data/raw/` | **Ignored.** Only `sales_sample.csv` is processed. |
+| Re-run with identical CSV | Idempotent. MERGE INTO updates existing rows with same values. |
+| Change amount for existing order_id | Updated in-place via MERGE INTO WHEN MATCHED. |
+| Add rows with new order_ids | Inserted via MERGE INTO WHEN NOT MATCHED. |
+| Add rows with new dates | Inserted. Watermark advances to highest date. |
+| Re-run after watermark set | Only rows newer than watermark are processed. |
 
 ---
 
 ## Roadmap
 
-- **Incremental ingestion + CDC** -- watermark-based extraction and MERGE INTO for upsert semantics
-- **Data quality checks** -- automated validation gates using Great Expectations or Soda
+- **Incremental upsert + watermark** -- watermark-based extraction and MERGE INTO for upsert semantics (complete)
+- **CSV auto-ingest** -- automatic schema inference and table creation from uploaded CSVs (complete)
+- **Data quality checks** -- automated validation gates with declarative check definitions (complete)
 - **CI/CD pipeline** -- GitHub Actions for linting, DAG validation, and integration testing
-- **Monitoring and observability** -- Prometheus metrics collection and Grafana dashboards
-- **Iceberg compaction + maintenance** -- automated snapshot expiry, orphan cleanup, and file compaction
+- **Monitoring and observability** -- Prometheus metrics collection and Grafana dashboards (complete)
+- **Iceberg compaction + maintenance** -- automated snapshot expiry, orphan cleanup, and file compaction (complete)
 - **Multi-tenant support** -- schema-level isolation, tenant provisioning, and row-level security
 
 See [`openspec/roadmap.md`](openspec/roadmap.md) for detailed phase descriptions and acceptance criteria.
