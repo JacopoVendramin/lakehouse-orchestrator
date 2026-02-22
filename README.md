@@ -1,0 +1,332 @@
+# Lakehouse Orchestrator
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docker Compose](https://img.shields.io/badge/Docker_Compose-ready-2496ED.svg)](docker-compose.yml)
+[![Airflow 2.10](https://img.shields.io/badge/Airflow-2.10-017CEE.svg)](https://airflow.apache.org/)
+[![Trino](https://img.shields.io/badge/Trino-latest-DD00A1.svg)](https://trino.io/)
+[![Apache Iceberg](https://img.shields.io/badge/Iceberg-REST_Catalog-blue.svg)](https://iceberg.apache.org/)
+
+An enterprise-grade, container-native lakehouse platform that ingests raw CSV data into Apache Iceberg tables and serves interactive dashboards -- deployed with a single command.
+
+---
+
+## Architecture Overview
+
+The platform runs seven core services on a single Docker bridge network. Apache Airflow orchestrates the data pipeline, writing raw files to SeaweedFS (S3-compatible storage) and registering Iceberg tables through Trino. Superset connects to Trino for business intelligence and visualization. PostgreSQL provides metadata storage for Airflow, Celery, and Superset. Valkey serves as the Celery message broker.
+
+```
+                            Data Flow
+  ┌─────────┐    ┌──────────────────────────────┐    ┌──────────────┐
+  │   CSV   │───>│        Apache Airflow        │───>│  SeaweedFS   │
+  │  Files  │    │  Scheduler | Worker | Flower │    │  (S3 API)    │
+  └─────────┘    └──────────────┬───────────────┘    └──────┬───────┘
+                                │                           │
+                     ┌──────────┴──────────┐                │
+                     │                     │                │
+              ┌──────▼──────┐  ┌───────────▼──┐   ┌────────▼───────┐
+              │ PostgreSQL  │  │    Valkey     │   │  Iceberg REST  │
+              │ (metadata)  │  │   (broker)    │   │   Catalog      │
+              └─────────────┘  └──────────────┘   └────────┬───────┘
+                                                           │
+                                                    ┌──────▼───────┐
+                                                    │    Trino     │
+                                                    │ (query engine)│
+                                                    └──────┬───────┘
+                                                           │
+                                                    ┌──────▼───────┐
+                                                    │   Superset   │
+                                                    │ (dashboards) │
+                                                    └──────────────┘
+```
+
+**Pipeline stages:** CSV → Airflow (validate + upload) → SeaweedFS (S3 object store) → Iceberg REST Catalog (table metadata) → Trino (distributed SQL) → Superset (visualization)
+
+---
+
+## Why This Stack
+
+### Why Iceberg over Hive
+
+| Criterion | Hive Table Format | Apache Iceberg |
+|-----------|-------------------|----------------|
+| Schema evolution | Limited `ALTER TABLE`; not always backward-compatible | Full add, drop, rename, reorder with metadata versioning |
+| Partition evolution | Requires rewriting all data | New partition specs apply to new data only |
+| Time travel | Not supported natively | Built-in snapshot isolation; query any historical state |
+| Hidden partitioning | Queries must reference partition columns explicitly | Partition transforms applied automatically |
+| File-level metadata | Partition-level tracking only | Per-file column min/max statistics for predicate pushdown |
+| Engine independence | Coupled to Hive metastore | Works with Trino, Spark, Flink without a Hive metastore |
+
+Iceberg provides stronger guarantees for schema evolution, partition management, and time travel -- critical for a lakehouse where schemas evolve as new sources are onboarded.
+
+### Why CeleryExecutor + Valkey
+
+Airflow's CeleryExecutor enables distributed task execution across horizontally scalable workers. Tasks are serialized as messages, sent to a broker, and consumed by any available worker -- allowing the platform to scale ingestion throughput by adding workers.
+
+Valkey 8 is a BSD 3-Clause licensed fork of Redis, maintained by the Linux Foundation. It provides 100% Redis wire-protocol compatibility, meaning Airflow's Celery integration connects via the standard `redis://` URI with no code changes. Choosing Valkey over Redis avoids the licensing ambiguity introduced by Redis Ltd.'s SSPL/RSALv2 relicensing.
+
+### Why SeaweedFS over MinIO
+
+| Criterion | MinIO | SeaweedFS |
+|-----------|-------|-----------|
+| License | AGPL-3.0 (copyleft) | Apache 2.0 (permissive) |
+| Architecture | Monolithic server | Separated master/volume/filer/S3 gateway |
+| Resource footprint | Heavier; designed for large-scale deployments | Lightweight; runs well on a single machine |
+| S3 compatibility | Full S3 API | Sufficient coverage for Iceberg, Trino, and Airflow |
+| Startup time | Moderate | Fast; volume servers register in seconds |
+
+SeaweedFS provides the S3 compatibility required by Trino's Iceberg connector and Airflow's boto3 client under a permissive Apache 2.0 license. Its separated architecture allows independent scaling of metadata and storage.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Docker Engine 20.10+ and Docker Compose v2
+- At least 8 GB of RAM allocated to Docker
+
+### Steps
+
+```bash
+git clone https://github.com/jvendramin/lakehouse-orchestrator.git
+cd lakehouse-orchestrator
+cp .env.example .env
+docker compose up -d
+```
+
+Initial startup takes approximately 2-3 minutes. Airflow runs database migrations and creates the admin user on first boot. SeaweedFS buckets (`lakehouse`, `lakehouse-warehouse`) are provisioned automatically by the `s3-init` container.
+
+Verify all services are healthy:
+
+```bash
+docker compose ps
+```
+
+Once all services report `healthy` or `running`, open the interfaces listed in the next section.
+
+---
+
+## Service Endpoints
+
+| Service | URL | Port | Credentials |
+|---------|-----|------|-------------|
+| Airflow Webserver | [http://localhost:8081](http://localhost:8081) | 8081 | `admin` / `admin` |
+| Flower (Celery monitor) | [http://localhost:5555](http://localhost:5555) | 5555 | -- |
+| Trino | [http://localhost:8083](http://localhost:8083) | 8083 | -- |
+| Superset | [http://localhost:8088](http://localhost:8088) | 8088 | `admin` / `admin` |
+| SeaweedFS S3 Gateway | [http://localhost:8333](http://localhost:8333) | 8333 | configured in `.env` |
+| SeaweedFS Master | [http://localhost:9333](http://localhost:9333) | 9333 | -- |
+| SeaweedFS Filer | [http://localhost:8888](http://localhost:8888) | 8888 | -- |
+| Iceberg REST Catalog | [http://localhost:8181](http://localhost:8181) | 8181 | -- |
+| PostgreSQL | `localhost:5432` | 5432 | `airflow` / `airflow` |
+
+All ports are configurable via environment variables in `.env`.
+
+---
+
+## How to Trigger the DAG
+
+The `csv_to_iceberg_pipeline` DAG is paused by default. Unpause and trigger it from the Airflow UI or the CLI:
+
+```bash
+# Unpause the DAG
+docker compose exec airflow-webserver airflow dags unpause csv_to_iceberg_pipeline
+
+# Trigger a DAG run
+docker compose exec airflow-webserver airflow dags trigger csv_to_iceberg_pipeline
+```
+
+The pipeline executes five sequential tasks:
+
+1. **validate_csv_schema** -- confirms the CSV matches the expected column contract
+2. **upload_csv_to_s3** -- uploads the raw file to SeaweedFS for durability
+3. **create_iceberg_namespace** -- creates the `iceberg.lakehouse` schema in Trino
+4. **create_iceberg_table** -- creates the partitioned Iceberg table (Parquet format, partitioned by `ingestion_date`)
+5. **insert_data_into_iceberg** -- loads rows using a delete-then-insert pattern for idempotency
+
+Monitor progress in the Airflow UI at [http://localhost:8081](http://localhost:8081) or watch Celery worker activity in Flower at [http://localhost:5555](http://localhost:5555).
+
+---
+
+## How to Query via Trino CLI
+
+Open an interactive Trino session:
+
+```bash
+docker compose exec trino trino
+```
+
+Run queries against the Iceberg lakehouse:
+
+```sql
+-- List available schemas
+SHOW SCHEMAS FROM iceberg;
+
+-- List tables in the lakehouse schema
+SHOW TABLES FROM iceberg.lakehouse;
+
+-- Preview all data
+SELECT * FROM iceberg.lakehouse.sales;
+
+-- Revenue by country
+SELECT
+    country,
+    SUM(amount) AS total_revenue,
+    COUNT(*)    AS orders
+FROM iceberg.lakehouse.sales
+GROUP BY country
+ORDER BY total_revenue DESC;
+
+-- Top customers by spend
+SELECT
+    customer_id,
+    SUM(amount)  AS total_spend,
+    COUNT(*)     AS order_count
+FROM iceberg.lakehouse.sales
+GROUP BY customer_id
+ORDER BY total_spend DESC
+LIMIT 10;
+```
+
+---
+
+## How to Connect Superset
+
+Superset is auto-configured on first startup. The bootstrap script registers a Trino database connection named **"Trino Lakehouse"** and starts the web server -- no manual setup required.
+
+### Manual Configuration
+
+If you need to add the connection manually (or reconfigure it):
+
+1. Open Superset at [http://localhost:8088](http://localhost:8088) and log in (`admin` / `admin`).
+2. Navigate to **Settings > Database Connections > + Database**.
+3. Select **Trino** as the database type.
+4. Enter the SQLAlchemy URI:
+
+   ```
+   trino://trino@trino:8080/iceberg/lakehouse
+   ```
+
+5. Test the connection and save.
+
+### Creating Datasets and Dashboards
+
+1. Go to **Datasets > + Dataset**.
+2. Select the **Trino Lakehouse** database, `lakehouse` schema, and `sales` table.
+3. Create charts using SQL Lab or the chart builder. Example queries:
+
+```sql
+-- Revenue by country (bar chart)
+SELECT country, SUM(amount) AS revenue
+FROM sales
+GROUP BY country
+ORDER BY revenue DESC;
+
+-- Daily order trends (line chart)
+SELECT ingestion_date, COUNT(*) AS orders, SUM(amount) AS revenue
+FROM sales
+GROUP BY ingestion_date
+ORDER BY ingestion_date;
+
+-- Top 5 customers (table)
+SELECT customer_id, SUM(amount) AS total_spend, COUNT(*) AS orders
+FROM sales
+GROUP BY customer_id
+ORDER BY total_spend DESC
+LIMIT 5;
+```
+
+---
+
+## Project Structure
+
+```
+lakehouse-orchestrator/
+├── airflow/
+│   ├── dags/
+│   │   └── csv_to_iceberg_celery.py   # Ingestion DAG: CSV → S3 → Iceberg
+│   ├── plugins/                        # Custom Airflow plugins (extensible)
+│   ├── Dockerfile                      # Custom Airflow image (boto3, trino, celery)
+│   └── requirements.txt               # Pinned Python dependencies
+├── data/
+│   └── raw/
+│       └── sales_sample.csv           # Sample dataset (20 records, 7 countries)
+├── openspec/
+│   ├── architecture.md                # Architecture specification
+│   ├── roadmap.md                     # Phased project roadmap
+│   └── specs/
+│       ├── celery_execution.md        # CeleryExecutor design spec
+│       ├── dashboard.md               # Superset dashboard spec
+│       ├── iceberg_tables.md          # Iceberg table design spec
+│       ├── ingestion.md               # Ingestion pipeline spec
+│       └── storage_layer.md           # Storage layer spec
+├── postgres/
+│   └── init-superset-db.sql           # Creates Superset database on first boot
+├── seaweedfs/
+│   └── s3-config.json                 # S3 gateway IAM and bucket configuration
+├── superset/
+│   ├── Dockerfile                     # Custom Superset image (sqlalchemy-trino)
+│   ├── bootstrap.sh                   # Auto-provisioning entrypoint script
+│   └── superset_config.py             # Superset application configuration
+├── trino/
+│   ├── catalog/
+│   │   └── iceberg.properties         # Iceberg connector: REST catalog + S3 backend
+│   └── config.properties              # Trino coordinator configuration
+├── .env.example                       # Environment variable template
+├── .gitignore
+├── docker-compose.yml                 # Full stack deployment (14 containers)
+└── README.md
+```
+
+---
+
+## Scaling Workers
+
+Scale Celery workers horizontally to increase ingestion throughput:
+
+```bash
+docker compose up --scale airflow-worker=3 -d
+```
+
+This starts three independent worker containers, each consuming tasks from the Valkey broker. Monitor worker status and task distribution in Flower at [http://localhost:5555](http://localhost:5555).
+
+To scale back down:
+
+```bash
+docker compose up --scale airflow-worker=1 -d
+```
+
+---
+
+## OpenSpec Documentation
+
+This project follows a spec-driven development methodology. Each major component was designed against a written specification before implementation. The full specification suite is available in the [`openspec/`](openspec/) directory:
+
+| Document | Description |
+|----------|-------------|
+| [`architecture.md`](openspec/architecture.md) | System architecture, networking, port mappings, and technology decisions |
+| [`roadmap.md`](openspec/roadmap.md) | Phased delivery plan with acceptance criteria |
+| [`specs/ingestion.md`](openspec/specs/ingestion.md) | Ingestion pipeline design |
+| [`specs/storage_layer.md`](openspec/specs/storage_layer.md) | SeaweedFS storage layer design |
+| [`specs/iceberg_tables.md`](openspec/specs/iceberg_tables.md) | Iceberg table schema and partitioning design |
+| [`specs/celery_execution.md`](openspec/specs/celery_execution.md) | CeleryExecutor configuration and worker design |
+| [`specs/dashboard.md`](openspec/specs/dashboard.md) | Superset dashboard and visualization design |
+
+---
+
+## Roadmap
+
+- **Incremental ingestion + CDC** -- watermark-based extraction and MERGE INTO for upsert semantics
+- **Data quality checks** -- automated validation gates using Great Expectations or Soda
+- **CI/CD pipeline** -- GitHub Actions for linting, DAG validation, and integration testing
+- **Monitoring and observability** -- Prometheus metrics collection and Grafana dashboards
+- **Iceberg compaction + maintenance** -- automated snapshot expiry, orphan cleanup, and file compaction
+- **Multi-tenant support** -- schema-level isolation, tenant provisioning, and row-level security
+
+See [`openspec/roadmap.md`](openspec/roadmap.md) for detailed phase descriptions and acceptance criteria.
+
+---
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
