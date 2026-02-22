@@ -1,0 +1,48 @@
+# =============================================================================
+# Lakehouse Orchestrator - Git Ignore
+# =============================================================================
+
+# Environment and secrets
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Airflow
+airflow/logs/
+airflow/plugins/__pycache__/
+
+# Docker
+docker-compose.override.yml
+
+# SeaweedFS data
+seaweedfs/data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Trino
+trino/data/
+
+# Superset
+superset/superset_home/
+
+# Logs
+logs/
+*.log
